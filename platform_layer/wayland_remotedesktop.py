@@ -46,8 +46,14 @@ REMOTE_DESKTOP = "org.freedesktop.portal.RemoteDesktop"
 SCREENCAST = "org.freedesktop.portal.ScreenCast"
 
 DEVICE_KEYBOARD, DEVICE_POINTER = 1, 2
-SOURCE_MONITOR = 1
-CURSOR_EMBEDDED = 2
+# ScreenCast source types. SOURCE_WINDOW makes every captured and injected
+# coordinate relative to the picked window, so the window can be moved without
+# invalidating calibration — see wayland_agents.
+SOURCE_MONITOR, SOURCE_WINDOW = 1, 2
+# Cursor modes. HIDDEN keeps the pointer out of captured frames, which matters
+# for template matching: an embedded cursor sitting over a button alters the
+# very pixels cv2.matchTemplate is scoring against it.
+CURSOR_HIDDEN, CURSOR_EMBEDDED, CURSOR_METADATA = 1, 2, 4
 
 # evdev button codes, which is what the portal expects.
 BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
@@ -62,14 +68,37 @@ class RemoteDesktopSession(PortalSession):
     IFACE = REMOTE_DESKTOP
     TOKEN_NAME = "remotedesktop_restore_token"
 
-    def __init__(self):
+    def __init__(self, token_name=None, source_types=SOURCE_MONITOR, label=None,
+                 cursor_mode=CURSOR_EMBEDDED):
+        """
+        token_name    file under CACHE_DIR holding this session's restore token.
+                      Each distinct session needs its OWN token: a token is
+                      bound to what the operator picked, so sharing one between
+                      a whole-screen session and a per-window session would
+                      restore the wrong source.
+        source_types  SOURCE_MONITOR (whole screen) or SOURCE_WINDOW (one
+                      window). With SOURCE_WINDOW every coordinate — captured
+                      and injected — is relative to that window, so the window
+                      can be MOVED without invalidating calibration.
+        label         human name used in prompts/logs, e.g. "agent1".
+        cursor_mode   CURSOR_HIDDEN keeps the pointer out of captured
+                      frames — the right choice when those frames feed
+                      template matching or OCR.
+        """
         super().__init__()
+        if token_name:
+            self.TOKEN_NAME = token_name
+        self._source_types = source_types
+        self._cursor_mode = cursor_mode
+        self.label = label or "screen"
         self._stream = None      # PipeWire node id, the absolute-coord frame
+        self._source_type = None  # what the portal actually granted
         self._size = None
         self._started = False
         self._fd = None          # PipeWire remote fd, for same-session capture
         self._pipeline = None
         self._sink = None
+        self._last_frame = None
 
     # ── handshake ────────────────────────────────────────────────────────────
 
@@ -103,9 +132,9 @@ class RemoteDesktopSession(PortalSession):
         tok = self._token("req")
         self._request("SelectSources", GLib.Variant("(oa{sv})", (self._session, {
             "handle_token": GLib.Variant("s", tok),
-            "types": GLib.Variant("u", SOURCE_MONITOR),
+            "types": GLib.Variant("u", self._source_types),
             "multiple": GLib.Variant("b", False),
-            "cursor_mode": GLib.Variant("u", CURSOR_EMBEDDED),
+            "cursor_mode": GLib.Variant("u", self._cursor_mode),
         })), tok, iface=SCREENCAST)
 
         tok = self._token("req")
@@ -121,12 +150,31 @@ class RemoteDesktopSession(PortalSession):
                 "motion needs one. Was ScreenCast.SelectSources accepted?")
         self._stream, props = streams[0]
         self._size = tuple(props["size"]) if "size" in props else None
+        # source_type is authoritative about WHAT was granted: 1=MONITOR,
+        # 2=WINDOW, 4=VIRTUAL. Never infer this from the stream size — a
+        # maximized window is exactly screen-sized and reads as a monitor.
+        self._source_type = props.get("source_type")
         self._started = True
 
     @property
     def stream_size(self):
         self.start()
         return self._size
+
+    @property
+    def source_type(self):
+        """1=MONITOR, 2=WINDOW, 4=VIRTUAL — what the portal granted."""
+        self.start()
+        return self._source_type
+
+    @property
+    def is_window_scoped(self):
+        """True when coordinates are relative to a window, not the screen.
+
+        Check THIS, never the stream size: a maximized window streams at the
+        full screen resolution and is indistinguishable from a monitor by size.
+        """
+        return self.source_type == SOURCE_WINDOW
 
     # ── capture on THIS session's stream ─────────────────────────────────────
     # Injection must be verifiable by observing the screen, and that only works
@@ -157,18 +205,38 @@ class RemoteDesktopSession(PortalSession):
             Gst.init(None)
             self._pipeline = Gst.parse_launch(
                 f"pipewiresrc fd={fd} path={self._stream} ! videoconvert ! "
-                f"pngenc ! appsink name=sink max-buffers=2 drop=true sync=false")
+                f"pngenc ! appsink name=sink max-buffers=4 drop=true sync=false")
             self._sink = self._pipeline.get_by_name("sink")
             self._pipeline.set_state(Gst.State.PLAYING)
+            # Keep warmup frames — the stream is damage-driven and a static
+            # screen may never produce another one. See wayland_screencast.
             for _ in range(warmup):
-                self._sink.emit("try-pull-sample", 5 * Gst.SECOND)
-        sample = self._sink.emit("try-pull-sample", 5 * Gst.SECOND)
-        if sample is None:
-            raise RuntimeError("no frame from the RemoteDesktop stream")
+                w = self._sink.emit("try-pull-sample", 5 * Gst.SECOND)
+                if w is not None:
+                    self._last_frame = self._sample_bytes(w) or self._last_frame
+        # Drain to the newest frame; see wayland_screencast.grab_png.
+        data = None
+        for _ in range(30):
+            sample = self._sink.emit("try-pull-sample", int(0.15 * Gst.SECOND))
+            if sample is None:
+                break
+            data = self._sample_bytes(sample) or data
+        if data:
+            self._last_frame = data
+        else:
+            data = self._last_frame
+        if not data:
+            raise RuntimeError("no frame has ever arrived from the "
+                               "RemoteDesktop stream")
+        return data
+
+    @staticmethod
+    def _sample_bytes(sample):
+        from gi.repository import Gst
         buf = sample.get_buffer()
         ok, info = buf.map(Gst.MapFlags.READ)
         if not ok:
-            raise RuntimeError("could not map frame buffer")
+            return None
         try:
             return bytes(info.data)
         finally:
