@@ -1,0 +1,14 @@
+pyautogui
+pyperclip
+pywin32; sys_platform == "win32"
+mss
+Pillow
+requests
+pytesseract
+opencv-python
+numpy
+
+# Linux/X11 backend (platform_layer/platform_x11.py). On Debian/Ubuntu prefer
+# the distro packages: python3-xlib python3-ewmh (built for the system Python).
+python-xlib; sys_platform == "linux"
+ewmh; sys_platform == "linux"

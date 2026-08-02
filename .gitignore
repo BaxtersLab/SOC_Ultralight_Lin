@@ -1,0 +1,15 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# SOC runtime artifacts (generated at run time, machine-specific)
+config.json
+.soc_alive
+soc_control.signal
+data_log/
+outbox/
+sent/
+staging/
+transcript/
