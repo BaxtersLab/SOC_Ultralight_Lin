@@ -32,6 +32,8 @@ TOKEN_FILE = CACHE_DIR / "screencast_restore_token"
 WARMUP_FRAMES = 5
 # Upper bound when draining a queued backlog to reach the newest frame.
 MAX_DRAIN = 30
+# How long to wait for a genuinely fresh frame before reusing the last one.
+FRESH_TIMEOUT = 2.0
 
 
 class ScreenCastSession:
@@ -241,7 +243,14 @@ class ScreenCastSession:
                 break
             data = frame
         if data is None:
-            data = self._last_frame
+            # Nothing was queued. Do NOT fall straight back to the retained
+            # frame: the short drain timeout only proves no frame was waiting,
+            # not that the source is static, and returning the old frame here
+            # is what made locate() report a window's PRE-MOVE position. Wait
+            # properly for a fresh one first.
+            data = self._pull(timeout_s=FRESH_TIMEOUT)
+        if data is None:
+            data = self._last_frame          # genuinely static source
         else:
             self._last_frame = data
         if data is None:

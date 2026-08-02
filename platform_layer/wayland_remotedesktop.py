@@ -221,6 +221,12 @@ class RemoteDesktopSession(PortalSession):
             if sample is None:
                 break
             data = self._sample_bytes(sample) or data
+        if data is None:
+            # Nothing queued: wait properly for a fresh frame rather than
+            # reusing the retained one. See wayland_screencast.grab_png.
+            sample = self._sink.emit("try-pull-sample", 2 * Gst.SECOND)
+            if sample is not None:
+                data = self._sample_bytes(sample)
         if data:
             self._last_frame = data
         else:
