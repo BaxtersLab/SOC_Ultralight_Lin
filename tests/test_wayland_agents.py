@@ -106,6 +106,57 @@ class PatchSelectionTests(unittest.TestCase):
         self.assertEqual(len(patches), 1)
 
 
+def _text_png(text, w=520, h=90, size=34):
+    """White image with `text` drawn large enough for tesseract to read."""
+    from PIL import Image, ImageDraw, ImageFont
+    for path in ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                 "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"):
+        if Path(path).exists():
+            font = ImageFont.truetype(path, size)
+            break
+    else:
+        raise unittest.SkipTest("no scalable font available for an OCR fixture")
+    im = Image.new("RGB", (w, h), "white")
+    ImageDraw.Draw(im).text((14, 20), text, fill="black", font=font)
+    out = io.BytesIO()
+    im.save(out, format="PNG")
+    return out.getvalue()
+
+
+class CalibrationGuardTests(unittest.TestCase):
+    """The marker check that stops calibration accepting the wrong window.
+
+    The portal returns pixels only — no title, app id or pid — so whatever the
+    compositor had on top at grab time is what arrives. During bring-up that
+    was a different application, and calibration accepted it; every later
+    locate() and click_at() then inherited the wrong reference.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from platform_layer.wayland_agents import AgentWindow
+            import pytesseract  # noqa: F401
+        except Exception as exc:
+            raise unittest.SkipTest(f"cannot import: {exc}")
+        cls.AW = AgentWindow
+
+    def test_marker_found_in_the_right_window(self):
+        png = _text_png("soc_loop_doc.txt")
+        self.assertTrue(self.AW._text_contains(png, "soc_loop_doc"))
+
+    def test_marker_absent_in_a_different_window(self):
+        """The case that actually happened: another app was captured."""
+        png = _text_png("Sign in to your account")
+        self.assertFalse(self.AW._text_contains(png, "soc_loop_doc"))
+
+    def test_match_tolerates_ocr_punctuation_and_case(self):
+        """OCR reads 'soc_loop_doc.txt' as 'soc loop doc,txt' often enough that
+        a strict check would train the operator to stop using it."""
+        png = _text_png("SOC_Loop_Doc.txt")
+        self.assertTrue(self.AW._text_contains(png, "soc loop doc"))
+
+
 class CalibrationStateTests(unittest.TestCase):
 
     @classmethod

@@ -188,10 +188,16 @@ class AgentWindow:
     def reference_path(self):
         return CACHE_DIR / f"{self.agent_id}_reference.png"
 
+    @property
+    def rejected_path(self):
+        """Last capture calibration refused. Overwritten each time, never read
+        by anything at runtime — it exists so a rejection can be looked at."""
+        return CACHE_DIR / f"{self.agent_id}_rejected.png"
+
     def is_calibrated(self):
         return self.reference_path.exists()
 
-    def calibrate(self, keep=True):
+    def calibrate(self, keep=True, expect=None, confirm=None):
         """Capture this agent's window once and save it as the reference.
 
         Opens a WINDOW portal session — the operator picks the window — while
@@ -199,6 +205,28 @@ class AgentWindow:
         The window session is closed immediately afterwards and never needed
         again: everything at runtime works from the desktop stream plus this
         saved image.
+
+        VERIFYING WHAT WAS ACTUALLY CAPTURED
+        ------------------------------------
+        The portal hands back pixels and nothing else — no title, no app id,
+        no pid. What arrives is whatever the compositor had on top at grab
+        time, so a window raised between the request and the grab is
+        calibrated silently in place of the intended one. That is not
+        hypothetical: it happened during bring-up, and SOC then clicked and
+        typed into the wrong application.
+
+        A wrong reference is worse than no reference, because every later
+        locate() and click_at() inherits it and SOC clicks unattended. So:
+
+        `expect`   substring that must appear in the captured window's OCR
+                   text — a title, a heading, anything the right window shows.
+        `confirm`  callable(png) -> bool, for showing the operator what was
+                   actually captured and requiring a yes.
+
+        Both are optional, but calibrating with neither means trusting
+        stacking order. On rejection nothing is saved AND the restore token is
+        dropped: a token pointing at the wrong window would quietly restore
+        that window on the next run, re-creating the fault without a picker.
         """
         cap = ScreenCastSession(
             source_types=SOURCE_WINDOW,
@@ -207,18 +235,40 @@ class AgentWindow:
             # template matching, and a cursor baked into the image would be
             # matched as though it were part of the window.
             cursor_mode=CURSOR_HIDDEN)
+
+        def reject(msg, image=None):
+            # Keep what was actually captured. Without it the operator is told
+            # "wrong window" with no way to see WHICH, and cannot tell a real
+            # mis-pick from a marker that simply did not OCR — the two have
+            # opposite remedies.
+            where = ""
+            if image is not None:
+                try:
+                    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    self.rejected_path.write_bytes(image)
+                    where = f" — what was captured: {self.rejected_path}"
+                except OSError:
+                    pass
+            cap.close()
+            self.forget()           # the token points at the wrong window too
+            raise WrongWindow(f"{self.agent_id}: {msg}{where}")
+
         with desktop().suspended():
             png = cap.grab_png()
             if cap.source_type() != SOURCE_WINDOW:
-                cap.close()
-                raise RuntimeError(
-                    f"{self.agent_id}: the portal granted a MONITOR, not a "
-                    f"window. Re-run and choose the Window tab.")
+                reject("the portal granted a MONITOR, not a window. Re-run and "
+                       "choose the Window tab.")
             content = self._content_bounds(png)
             if content is None:
-                cap.close()
-                raise RuntimeError(f"{self.agent_id}: captured frame was blank")
+                reject("captured frame was blank")
             image = self._crop_png(png, content)
+
+            if expect is not None and not self._text_contains(image, expect):
+                reject(f"the captured window does not show {expect!r} — another "
+                       f"window was on top at grab time", image)
+            if confirm is not None and not confirm(image):
+                reject("the operator rejected the captured window", image)
+
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             self.reference_path.write_bytes(image)
             cap.close()
@@ -227,6 +277,24 @@ class AgentWindow:
         if not keep:
             self.forget()
         return self.reference_size
+
+    @staticmethod
+    def _text_contains(png, expect):
+        """Is `expect` in the image's OCR text?
+
+        Compared with case, whitespace and punctuation stripped from both
+        sides: OCR routinely reads 'soc_loop_doc.txt' as 'soc loop doc,txt',
+        and a marker check strict enough to fail on that would train the
+        operator to skip it.
+        """
+        import re
+
+        import pytesseract
+        from PIL import Image
+        text = pytesseract.image_to_string(
+            Image.open(io.BytesIO(png)), config="--psm 6")
+        flat = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
+        return flat(expect) in flat(text)
 
     def forget(self):
         """Drop the reference so the agent must be calibrated again."""
@@ -429,6 +497,15 @@ class AgentWindow:
 
 class WindowNotFound(RuntimeError):
     """The agent's window could not be found on screen."""
+
+
+class WrongWindow(RuntimeError):
+    """Calibration captured something other than the intended window.
+
+    Separate from WindowNotFound because the remedy differs: this one means
+    re-calibrate with the right window on top, not wait for it to become
+    visible.
+    """
 
 
 def agent_window(agent_id):
