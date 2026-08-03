@@ -195,7 +195,7 @@ class RemoteDesktopSession(PortalSession):
         self._fd = fds.get(reply.unpack()[0])
         return self._fd
 
-    def grab_png(self, warmup=5):
+    def grab_png(self, warmup=5, fresh=False):
         """One PNG frame from this session's stream, cursor included."""
         import gi
         gi.require_version("Gst", "1.0")
@@ -214,6 +214,28 @@ class RemoteDesktopSession(PortalSession):
                 w = self._sink.emit("try-pull-sample", 5 * Gst.SECOND)
                 if w is not None:
                     self._last_frame = self._sample_bytes(w) or self._last_frame
+        if fresh:
+            # "Re-measure now" must mean a frame captured AFTER this call.
+            # Buffers already queued may predate whatever prompted the
+            # re-measure — a window move, for instance — so discard the whole
+            # backlog first and then wait for a genuinely new frame. Without
+            # this a forced re-locate can report a window's PRE-MOVE position
+            # from a stale queued frame while a later call gets it right.
+            while self._sink.emit("try-pull-sample", int(0.05 * Gst.SECOND)):
+                pass
+            # Drop ONE more: the buffer that arrives immediately after the
+            # backlog may already have been captured before the change that
+            # prompted this re-measure (compositor repaint lags the request),
+            # so it is "new" yet still shows the old state. The one after it
+            # cannot be.
+            self._sink.emit("try-pull-sample", 2 * Gst.SECOND)
+            sample = self._sink.emit("try-pull-sample", 3 * Gst.SECOND)
+            if sample is not None:
+                got = self._sample_bytes(sample)
+                if got:
+                    self._last_frame = got
+                    return got
+
         # Drain to the newest frame; see wayland_screencast.grab_png.
         data = None
         for _ in range(30):
@@ -293,11 +315,36 @@ class RemoteDesktopSession(PortalSession):
         self.keysym(sym, False)
 
     def close(self):
-        if self._session and self._bus:
+        """Release the stream and the portal session.
+
+        Must actually tear down the GStreamer pipeline and the PipeWire fd, not
+        merely forget the session handle: only ONE PipeWire stream can be open
+        at a time (a second permanently freezes the first), so a half-closed
+        session stops the next one from ever working.
+        """
+        import os
+        if self._pipeline is not None:
+            from gi.repository import Gst
+            self._pipeline.set_state(Gst.State.NULL)
+            self._pipeline = self._sink = None
+        if self._fd is not None:
             try:
-                self._call("Close", None,
-                           iface="org.freedesktop.portal.Session")
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+        if self._session and self._bus:
+            # Session.Close lives on the SESSION's own object path, not the
+            # portal's — calling it on the portal path silently does nothing.
+            try:
+                from gi.repository import Gio
+                self._bus.call_sync(
+                    "org.freedesktop.portal.Desktop", self._session,
+                    "org.freedesktop.portal.Session", "Close", None, None,
+                    Gio.DBusCallFlags.NONE, 2000, None)
             except Exception:
                 pass
         self._started = False
         self._session = None
+        self._stream = None
+        self._last_frame = None
