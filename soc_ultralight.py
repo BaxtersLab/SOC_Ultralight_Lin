@@ -215,6 +215,22 @@ def _hands_wrap(fn):
     return _gated
 
 
+# On Wayland, point pyautogui and ImageGrab at the portal/PipeWire desktop
+# BEFORE the hands guard wraps them, so the guard wraps the working functions
+# and the operator-yield rule still applies. Ordering matters: installing after
+# the loop below would replace the guarded functions with unguarded ones.
+#
+# Without this, every pyautogui call and every ImageGrab capture fails SILENTLY
+# on Wayland — XTest clicks into nothing, and root-window capture returns a
+# black or XWayland-only image. No-op unless SOC_PLATFORM=wayland.
+try:
+    from platform_layer.wayland_shims import install as _install_wayland_shims
+    if _install_wayland_shims():
+        print("[platform] Wayland: pyautogui + ImageGrab routed through "
+              "xdg-desktop-portal / PipeWire")
+except Exception as _exc:                        # never block startup on this
+    print(f"[platform] Wayland shim NOT installed: {_exc}")
+
 for _hands_fn in ("click", "rightClick", "doubleClick", "tripleClick",
                   "moveTo", "moveRel", "dragTo", "dragRel",
                   "typewrite", "write", "hotkey", "press",
