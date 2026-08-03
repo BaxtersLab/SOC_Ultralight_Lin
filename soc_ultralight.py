@@ -1306,19 +1306,31 @@ class SelfModGate:
 
 class AgentConfig:
     __slots__ = ("hwnd", "title", "input_xy", "send_xy",
-                 "scroll_dn_xy", "scroll_up_xy", "ocr_region",
+                 "scroll_dn_xy", "scroll_up_xy", "ocr_region", "rel_region",
                  "lbl_window", "lbl_input", "lbl_send", "lbl_scroll", "lbl_region",
                  "lbl_pending", "lbl_pending_dot",
                  "prefix_var", "prefix_enabled", "msg_count")
 
     def __init__(self):
-        self.hwnd:         int | None                    = None
+        #: Opaque platform reference to the agent's window. An int HWND on
+        #: win32 and an XID on X11. On Wayland there ARE no window handles —
+        #: the compositor exposes no cross-client window API — so it holds the
+        #: agent id, and the saved reference image is what actually identifies
+        #: the window. Treated as a truthy "this agent is designated" flag
+        #: everywhere except the focus call, which is platform-specific.
+        self.hwnd:         int | str | None              = None
         self.title:        str                           = "(not set)"
         self.input_xy:     tuple[int, int] | None        = None
         self.send_xy:      tuple[int, int] | None        = None
         self.scroll_dn_xy: tuple[int, int] | None        = None
         self.scroll_up_xy: tuple[int, int] | None        = None
         self.ocr_region:   tuple[int,int,int,int] | None = None  # x1,y1,x2,y2
+        #: Wayland only: ocr_region expressed as offsets from the window's
+        #: top-left. ocr_region itself stays SCREEN-ABSOLUTE because every
+        #: consumer (ImageGrab bbox, pyautogui.scroll) takes absolute
+        #: coordinates; this is what lets it be re-derived when the window
+        #: moves, instead of being frozen at calibration time.
+        self.rel_region:   tuple[int,int,int,int] | None = None
         self.lbl_window    = None
         self.lbl_input     = None
         self.lbl_send      = None
@@ -3455,7 +3467,200 @@ class SOCUltralight:
 
     # ── Agent window + coord capture ──────────────────────────────────────────
 
+    # ── Window designation ───────────────────────────────────────────────────
+    # win32/X11: the operator hovers and the window under the cursor is read.
+    # Wayland: neither half of that exists — there is no cursor_pos() and no
+    # window_from_point(), because the compositor exposes no cross-client
+    # window API at all. The window is designated through the ScreenCast
+    # portal instead, and thereafter identified by correlating a saved
+    # reference image against the desktop frame. See wayland_agents.py.
+
+    def _agent_window(self, agent_id: str):
+        """This agent's Wayland window tracker, or None on other platforms."""
+        if PLATFORM.name != "wayland":
+            return None
+        try:
+            from platform_layer.wayland_agents import agent_window
+            return agent_window(agent_id)
+        except Exception as ex:
+            self._log(f"[{agent_id}] wayland tracker unavailable: {ex}")
+            return None
+
+    def _focus_agent(self, agent_id: str) -> bool:
+        """Bring the agent's window forward; on Wayland, re-find it first.
+
+        Every interaction already passed through focus_window, which makes this
+        the natural point to refresh a Wayland agent's position — so a window
+        the operator has moved keeps working instead of silently accumulating
+        clicks at its old coordinates.
+
+        Wayland cannot raise another client's window: no protocol exists. That
+        is reported honestly rather than faked. Callers proceed regardless,
+        which is correct here — clicks are aimed by locating the window
+        visually, so they land on the right pixels whether or not it is
+        focused.
+        """
+        cfg = self.agents.get(agent_id)
+        if not cfg or not cfg.hwnd:
+            return False
+        if PLATFORM.name != "wayland":
+            return PLATFORM.focus_window(cfg.hwnd)
+
+        win = self._agent_window(agent_id)
+        if win is None:
+            return False
+        try:
+            origin, conf = win.locate(force=True)
+            if origin is None:
+                self._log(f"[{agent_id}] window not visible (best match "
+                          f"{conf:.2f}) — minimized, occluded, or on another "
+                          f"workspace")
+                return False
+            ox, oy = origin
+            w, h = win.reference_size
+            dx0, dy0, dx1, dy1 = cfg.rel_region or (0, 0, w, h)
+            cfg.ocr_region = (ox + dx0, oy + dy0, ox + dx1, oy + dy1)
+            return True
+        except Exception as ex:
+            self._log(f"[{agent_id}] locate failed: {ex}")
+            return False
+
     def _set_window(self, agent_id: str):
+        """Designate the agent's window (platform-specific — see above)."""
+        if PLATFORM.name == "wayland":
+            return self._set_window_wayland(agent_id)
+        return self._set_window_pointer(agent_id)
+
+    def _set_window_wayland(self, agent_id: str):
+        """Portal-based designation, confirmed against a preview.
+
+        The portal returns pixels and nothing else — no title, no app id, no
+        pid — so what arrives is whatever the compositor had on top at grab
+        time. Showing the operator the actual capture is the only way to catch
+        a wrong pick; without it a mis-pick becomes this agent's permanent
+        reference and SOC then clicks into an unrelated application. That is
+        not hypothetical — it happened during bring-up.
+        """
+        names = {"agent1": "Agent 1", "agent2": "Agent 2",
+                 "agent3": "Agent 3", "agent5": "Agent 5"}
+        label = names.get(agent_id, agent_id)
+        win = self._agent_window(agent_id)
+        if win is None:
+            self._set_status("Wayland window tracker unavailable")
+            return
+
+        self._set_status(f"Pick the {label} window in the portal dialog …")
+
+        def _work():
+            try:
+                w, h = win.calibrate(confirm=self._confirm_capture(label))
+            except Exception as ex:
+                self.root.after(0, lambda e=ex: self._calibration_failed(agent_id, e))
+                return
+            self.root.after(0, lambda: self._calibration_done(agent_id, w, h))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _calibration_done(self, agent_id: str, w: int, h: int):
+        cfg = self.agents[agent_id]
+        cfg.hwnd       = agent_id        # opaque ref: Wayland has no handles
+        cfg.title      = f"{agent_id} ({w}x{h})"
+        cfg.rel_region = (0, 0, w, h)
+        located = self._focus_agent(agent_id)   # fills ocr_region from origin
+
+        if cfg.lbl_window:
+            cfg.lbl_window.config(text=f"window: calibrated ✓", fg=GREEN)
+        if cfg.lbl_region:
+            cfg.lbl_region.config(text=f"region: {w}x{h}px (window)", fg=ACCENT)
+        if located:
+            self._log(f"[{agent_id}] window calibrated: {w}x{h} at "
+                      f"{cfg.ocr_region[:2]}")
+            self._set_status(f"{agent_id} window calibrated")
+        else:
+            # Calibration itself succeeded — the reference is saved and usable.
+            # Only the immediate re-find failed, which is expected if the
+            # portal dialog is still fading out over the window.
+            self._log(f"[{agent_id}] calibrated, but not locatable right now "
+                      f"— it will be re-found on next use")
+            self._set_status(f"{agent_id} calibrated (not visible yet)")
+        self._save_config()
+        self._check_phase1_complete()
+
+    def _calibration_failed(self, agent_id: str, ex: Exception):
+        self._log(f"[{agent_id}] calibration failed: {ex}")
+        self._set_status(f"{agent_id} calibration failed — see log")
+        cfg = self.agents[agent_id]
+        if cfg.lbl_window:
+            cfg.lbl_window.config(text="window: not set", fg=RED)
+
+    def _confirm_capture(self, label: str):
+        """Build the confirm(png) -> bool callback calibrate() calls.
+
+        calibrate() runs on a worker thread because the portal call blocks on
+        a GLib loop, but Tk may only be driven from the main thread — so the
+        callback posts the dialog and waits for the answer.
+        """
+        def confirm(png: bytes) -> bool:
+            answer = {}
+            done = threading.Event()
+
+            def ask():
+                try:
+                    answer["ok"] = self._preview_dialog(png, label)
+                finally:
+                    done.set()
+
+            self.root.after(0, ask)
+            if not done.wait(timeout=180):
+                return False          # never answered — refuse rather than guess
+            return bool(answer.get("ok"))
+        return confirm
+
+    def _preview_dialog(self, png: bytes, label: str) -> bool:
+        """Show what was actually captured and ask whether it is right."""
+        import io
+        img = Image.open(io.BytesIO(png)).convert("RGB")
+        scale = min(560 / img.width, 420 / img.height, 1.0)
+        if scale < 1.0:
+            img = img.resize((max(int(img.width * scale), 1),
+                              max(int(img.height * scale), 1)), Image.LANCZOS)
+
+        top = tk.Toplevel(self.root)
+        top.title(f"Confirm {label} window")
+        top.configure(bg=BG)
+        top.transient(self.root)
+        top.grab_set()
+        result = {"ok": False}
+
+        tk.Label(top, text=f"Is this the {label} window?", bg=BG, fg=FG,
+                 font=("Segoe UI", 11, "bold")).pack(padx=16, pady=(14, 4))
+        tk.Label(top, text="This exact image becomes the reference SOC uses to "
+                           "find the window.", bg=BG, fg=FG,
+                 wraplength=520, justify="left").pack(padx=16, pady=(0, 10))
+
+        photo = ImageTk.PhotoImage(img)
+        holder = tk.Label(top, image=photo, bd=1, relief="solid", bg=BG2)
+        holder.image = photo          # hold a ref or Tk garbage-collects it
+        holder.pack(padx=16)
+
+        row = tk.Frame(top, bg=BG)
+        row.pack(pady=12)
+
+        def close(ok):
+            result["ok"] = ok
+            top.destroy()
+
+        tk.Button(row, text="Use this window", bg=GREEN, fg=BG, relief="flat",
+                  padx=14, pady=4, command=lambda: close(True)).pack(side="left", padx=6)
+        tk.Button(row, text="Cancel", bg=BG2, fg=FG, relief="flat",
+                  padx=14, pady=4, command=lambda: close(False)).pack(side="left", padx=6)
+
+        top.protocol("WM_DELETE_WINDOW", lambda: close(False))
+        top.bind("<Escape>", lambda _e: close(False))
+        self.root.wait_window(top)
+        return result["ok"]
+
+    def _set_window_pointer(self, agent_id: str):
         """Countdown capture: status bar counts down 5s while user hovers cursor
         over the target window — no key press required."""
         names = {"agent1": "Agent 1", "agent2": "Agent 2", "agent3": "Agent 3"}
@@ -3821,7 +4026,7 @@ class SOCUltralight:
                 pyperclip.copy(text)
 
                 # Restore and focus the target window (robust foreground set)
-                PLATFORM.focus_window(cfg.hwnd)
+                self._focus_agent(agent_id)
                 time.sleep(PASTE_DELAY)
 
                 tmpl_input, tmpl_send = self._find_two_buttons(agent_id)
@@ -3850,7 +4055,7 @@ class SOCUltralight:
                         self._set_status(
                             f"⚠ {agent_id}: input field missing — set via ⊙ Input")
                         return
-                    PLATFORM.focus_window(cfg.hwnd)
+                    self._focus_agent(agent_id)
                     time.sleep(PASTE_DELAY)
 
                 # Click & paste sequence
@@ -5180,18 +5385,21 @@ class SOCUltralight:
         self._last_ocr_text.pop(agent_id, None)
         self._last_strip_state.pop(agent_id, None)
 
+        # ── Focus Copilot window ──────────────────────────────────────────────
+        # Focus FIRST. On Wayland this call is also what re-locates the window
+        # and refreshes ocr_region, so the region has to be read AFTER it —
+        # reading first would use the position the window had last time.
+        try:
+            self._focus_agent(agent_id)
+            time.sleep(0.25)
+        except Exception as e:
+            self._log(f"[nudge:{agent_id}] focus error: {e}")
+
         rx0, ry0, rx1, ry1 = cfg.ocr_region
         # Copy button sits ~153px from OCR left edge, ~41px above OCR bottom.
         # Define up front so hover sweep uses the correct x (NOT centre).
         fb_x = rx0 + 153
         fb_y = ry1 - 41
-
-        # ── Focus Copilot window ──────────────────────────────────────────────
-        try:
-            PLATFORM.focus_window(cfg.hwnd)
-            time.sleep(0.25)
-        except Exception as e:
-            self._log(f"[nudge:{agent_id}] focus error: {e}")
 
         # ── Step 1: scroll to bottom, using the sentinel as the "there yet?" signal ──
         # The "scroll to latest" chevron can't be reliably template-matched
@@ -5670,7 +5878,7 @@ class SOCUltralight:
         cfg_focus = self.agents.get(agent_id)
         if cfg_focus and cfg_focus.hwnd:
             try:
-                PLATFORM.focus_window(cfg_focus.hwnd)
+                self._focus_agent(agent_id)
                 time.sleep(0.3)
                 # Re-hover so Electron re-renders the hover overlay after focus change.
                 pyautogui.moveTo(x, y, duration=0.15)
@@ -5863,16 +6071,17 @@ class SOCUltralight:
             self._last_ocr_text.pop(agent_id, None)
             self._last_strip_state.pop(agent_id, None)
 
-            rx0, ry0, rx1, ry1 = cfg.ocr_region
-            sweep_x = (rx0 + rx1) // 2
-
-            # Focus VS Code window
+            # Focus VS Code window — before reading the region, because on
+            # Wayland this is also what re-locates the window and refreshes it.
             try:
                 if cfg.hwnd:
-                    PLATFORM.focus_window(cfg.hwnd)
+                    self._focus_agent(agent_id)
                     time.sleep(0.25)
             except Exception as e:
                 self._log(f"[nudge:{agent_id}] focus error: {e}")
+
+            rx0, ry0, rx1, ry1 = cfg.ocr_region
+            sweep_x = (rx0 + rx1) // 2
 
             # Scroll to bottom — try trained scroll_dn template first
             scroll_xy = self._find_template_at(
@@ -7150,6 +7359,7 @@ class SOCUltralight:
                 "prefix_enabled": cfg.prefix_enabled.get() if cfg.prefix_enabled else False,
                 "prefix_text":    cfg.prefix_var.get()     if cfg.prefix_var    else "",
                 "ocr_region":     list(cfg.ocr_region)    if cfg.ocr_region    else None,
+                "rel_region":     list(cfg.rel_region)    if cfg.rel_region    else None,
                 "input_xy":       list(cfg.input_xy)      if cfg.input_xy      else None,
                 "send_xy":        list(cfg.send_xy)        if cfg.send_xy       else None,
                 "scroll_dn_xy":   list(cfg.scroll_dn_xy)  if cfg.scroll_dn_xy  else None,
@@ -7194,6 +7404,20 @@ class SOCUltralight:
             d = data.get(aid, {})
             if d.get("window_title"):
                 cfg.title = d["window_title"]
+            # On Wayland the designation IS the saved reference image, so it
+            # survives a restart and the agent can be restored as configured —
+            # unlike an HWND/XID, which is meaningless in a new session and is
+            # deliberately never persisted. Restored only when the reference
+            # file is actually present, so a deleted one re-prompts.
+            if PLATFORM.name == "wayland":
+                win = self._agent_window(aid)
+                if win is not None and win.is_calibrated():
+                    cfg.hwnd = aid
+                    if self._valid_region(d.get("rel_region")):
+                        cfg.rel_region = tuple(d["rel_region"])
+                    else:
+                        w, h = win.reference_size
+                        cfg.rel_region = (0, 0, w, h)
             if cfg.prefix_var and d.get("prefix_text"):
                 cfg.prefix_var.set(d["prefix_text"])
             if cfg.prefix_enabled and d.get("prefix_enabled"):
@@ -7905,7 +8129,7 @@ class SOCUltralight:
             self._log(f"[scroll] {agent_id} window not set — click Set Window first")
             return
         try:
-            PLATFORM.focus_window(cfg.hwnd)
+            self._focus_agent(agent_id)
             time.sleep(0.3)
         except Exception as exc:
             self._log(f"[scroll] focus error: {exc}")
