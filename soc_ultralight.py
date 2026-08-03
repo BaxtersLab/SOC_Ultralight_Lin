@@ -3415,6 +3415,51 @@ class SOCUltralight:
                 target=self._autoclick_loop, daemon=True)
             self._autoclick_thread.start()
 
+    @staticmethod
+    def _template_path(stem: str):
+        """Resolve a template stem to its real file, whatever the case.
+
+        The library carries BOTH `.png` and `.PNG` — 20 and 19 of them. Windows
+        filesystems match either spelling, so `f"{stem}.png"` always resolved
+        there; ext4 does not, so on Linux the 19 uppercase templates simply did
+        not exist as far as the scan was concerned. The panel lists them (it
+        uses template_pngs(), which is case-insensitive), so the operator could
+        tick a box for a template the loop could never load and nothing would
+        ever happen. Returns None when no file matches.
+        """
+        for cand in (TEMPLATE_DIR / f"{stem}.png", TEMPLATE_DIR / f"{stem}.PNG"):
+            if cand.exists():
+                return cand
+        low = stem.lower()
+        for p in template_pngs():
+            if p.stem.lower() == low:
+                return p
+        return None
+
+    def _grab_desktop_bgr(self, sct):
+        """Whole desktop as a BGR array, plus its screen-space origin.
+
+        Returns (image, left, top) so callers can convert match coordinates
+        into absolute screen coordinates.
+
+        mss reads the X11 root window. Under Wayland that window holds nothing:
+        measured here it returns a frame of mean 0.0 and stdev 0.0 — pure black
+        at full resolution, with no error raised. Every template match then
+        fails silently, which is exactly how auto-click could appear to run
+        while never clicking anything. On Wayland the frame comes from the
+        portal/PipeWire stream instead, whose origin is always (0, 0).
+        """
+        if PLATFORM.name == "wayland":
+            import io
+            from platform_layer.wayland_agents import desktop
+            from PIL import Image
+            img = Image.open(io.BytesIO(desktop().frame())).convert("RGB")
+            return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR), 0, 0
+        mon = sct.monitors[0]                      # full virtual desktop
+        raw = sct.grab(mon)
+        bgr = cv2.cvtColor(np.array(raw, dtype=np.uint8), cv2.COLOR_BGRA2BGR)
+        return bgr, mon["left"], mon["top"]
+
     def _autoclick_loop(self):
         """Background thread: periodically screenshot the desktop, match all
         enabled templates, click any that appear, respecting per-template cooldown.
@@ -3429,15 +3474,12 @@ class SOCUltralight:
                     # Snapshot the enabled set — no Tcl calls from this thread
                     enabled = set(self._autoclick_enabled)
                     if enabled:
-                        mon = sct.monitors[0]   # full virtual desktop
-                        raw = sct.grab(mon)
-                        screen_bgr = cv2.cvtColor(
-                            np.array(raw, dtype=np.uint8), cv2.COLOR_BGRA2BGR)
+                        screen_bgr, mon_left, mon_top = self._grab_desktop_bgr(sct)
 
                         now = time.time()
                         for stem in enabled:
-                            png = TEMPLATE_DIR / f"{stem}.png"
-                            if not png.exists():
+                            png = self._template_path(stem)
+                            if png is None:
                                 continue
                             # Per-template cooldown
                             if now - self._autoclick_last.get(stem, 0) < AUTOCLICK_COOLDOWN:
@@ -3454,8 +3496,8 @@ class SOCUltralight:
                                 # not pixel-offsets within the mss capture buffer.
                                 # Matters when a monitor sits above/left of primary
                                 # (mon['top'] or mon['left'] is negative).
-                                cx = max_loc[0] + w_t // 2 + mon['left']
-                                cy = max_loc[1] + h_t // 2 + mon['top']
+                                cx = max_loc[0] + w_t // 2 + mon_left
+                                cy = max_loc[1] + h_t // 2 + mon_top
                                 pyautogui.click(cx, cy)
                                 self._autoclick_last[stem] = time.time()
                                 self._log(

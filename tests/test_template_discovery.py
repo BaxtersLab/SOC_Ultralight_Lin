@@ -86,5 +86,55 @@ class TemplateDiscoveryTests(unittest.TestCase):
                          f"not being loaded")
 
 
+
+class AutoclickTemplatePathTests(unittest.TestCase):
+    """Auto-click must find a template whatever the extension's case.
+
+    The loop used to rebuild the path as f"{stem}.png". Windows matches either
+    spelling; ext4 does not, so the 19 uppercase .PNG templates were invisible
+    to the scan while still being listed in the panel — the operator could
+    enable one and nothing would ever happen, with no error anywhere.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import soc_ultralight as soc
+        except Exception as exc:
+            raise unittest.SkipTest(f"cannot import soc_ultralight: {exc}")
+        cls.soc = soc
+
+    def test_resolves_both_cases(self):
+        d = self.soc.TEMPLATE_DIR
+        if not d.is_dir():
+            self.skipTest("buttons database/ not present")
+        stems = [p.stem for p in self.soc.template_pngs(d)]
+        if not stems:
+            self.skipTest("no templates on disk")
+        unresolved = [st for st in stems
+                      if self.soc.SOCUltralight._template_path(st) is None]
+        self.assertEqual(unresolved, [],
+                         f"{len(unresolved)} template(s) cannot be resolved by "
+                         f"the auto-click loop")
+
+    def test_uppercase_templates_are_reachable(self):
+        d = self.soc.TEMPLATE_DIR
+        if not d.is_dir():
+            self.skipTest("buttons database/ not present")
+        upper = [p for p in self.soc.template_pngs(d) if p.suffix == ".PNG"]
+        if not upper:
+            self.skipTest("no uppercase templates in this library")
+        for p in upper:
+            with self.subTest(template=p.name):
+                self.assertIsNotNone(
+                    self.soc.SOCUltralight._template_path(p.stem),
+                    f"{p.name} is listed but unreachable — the exact bug that "
+                    f"silently disabled {len(upper)} auto-click templates")
+
+    def test_unknown_stem_returns_none_rather_than_a_bad_path(self):
+        self.assertIsNone(
+            self.soc.SOCUltralight._template_path("definitely_not_a_template_xyz"))
+
+
 if __name__ == "__main__":
     unittest.main()
