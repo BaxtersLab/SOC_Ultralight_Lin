@@ -2,6 +2,123 @@
 
 _Append-only (Article VIII). Newest entry at the top._
 
+## [2026-08-03] — **SOC runs on Wayland.** Full agent loop verified 11/11 on a native Wayland window; Set Win calibration UI replaced; 137 tests green
+
+Commits `2dfe2df` → `359d2e7` → `58e81ae`, pushed to `BaxtersLab/SOC_Ultralight_Lin`.
+
+### Done
+
+**1. The Wayland backend is wired in under SOC's existing call sites (`2dfe2df`).**
+SOC drives the desktop through pyautogui (33 call sites) and reads it through PIL.ImageGrab/mss
+(8 more). None work on Wayland — pyautogui's backend is XTest, ImageGrab captures the X root
+window, and under XWayland both see only XWayland clients, so they fail *silently* by clicking
+into nothing and returning partial images. `platform_layer/wayland_shims.py` routes all 41
+through the portal/PipeWire desktop stream, so **no call site changed**.
+
+Install order is load-bearing: the shim installs **before** the `_hands_wrap` loop, so the hands
+guard wraps the working functions. Installing after would have replaced the guarded functions
+with unguarded ones and silently disabled the operator-yield rule.
+
+**2. A full agent loop, end to end (`soc_port/verify_agent_loop.py`, 11/11).**
+calibrate → locate (conf 1.000) → crop → OCR → click a window-relative point → type through the
+pyautogui shim → **read the typed token back out of the window's own pixels**. Target was a
+native Wayland window, asserted invisible to `xdotool` so the test cannot pass through XWayland
+by accident.
+
+**3. Calibration now verifies WHICH window it captured (`359d2e7`).**
+The ScreenCast portal returns pixels and nothing else — no title, no app id, no pid — so
+`calibrate()` was trusting compositor stacking order and saving the result as ground truth.
+During bring-up the portal returned a *different* application's window; calibration accepted it,
+and the click and keystrokes that followed went into an unrelated app (a sign-in form). A wrong
+reference is worse than no reference: every later `locate()` and `click_at()` inherits it and SOC
+clicks unattended.
+
+`calibrate()` now takes `expect=` (OCR marker) and `confirm=` (preview callback). On rejection
+nothing is saved, the **restore token is dropped too** — a token pointing at the wrong window
+would silently restore it next run with no picker shown — and the refused capture is written to
+`<agent>_rejected.png`, because "wrong window" with no way to see *which* cannot be told apart
+from a marker that simply did not OCR, and those have opposite remedies.
+
+**4. Set Win replaced on Wayland (`58e81ae`).**
+The old flow hovered the cursor and read the window underneath. Neither half exists here: no
+`cursor_pos()`, no `window_from_point()`. `_set_window` now dispatches — win32/X11 keep the hover
+path **untouched**; Wayland uses the portal picker plus the preview-confirm dialog.
+
+`ocr_region` stays screen-absolute (every consumer — `ImageGrab` bbox, `pyautogui.scroll` — takes
+absolute coordinates) but on Wayland is re-derived from the tracked window origin plus a new
+window-relative `rel_region`, so a **window the operator moves keeps working**. The refresh lives
+in `_focus_agent`, which the six former `focus_window` callers now route through; that call
+already preceded every interaction. Two of those six read `ocr_region` *before* focusing — that
+ordering is now inverted, since focusing is what refreshes it.
+
+`cfg.hwnd` holds the agent id on Wayland (documented as an opaque platform reference). Because
+identity is a saved image rather than a session-scoped handle, **calibration survives a restart**
+— restored only when the reference file exists, so a deleted one re-prompts.
+
+### Remaining
+
+- **`⊙ Input` / `⊙ Send` / scroll coordinate capture are still dead on Wayland**
+  (`soc_ultralight.py` `_capture_coord` / `_do_capture`). They use the same hover + `cursor_pos()`
+  approach Set Win used. Planned fix: let the operator click the target **on the captured window
+  image**, which yields window-relative coordinates that follow the window — reusing the preview
+  dialog already built. This is the last blocker to a fully calibrated agent on Wayland.
+- Text-bearing templates still need re-capturing against Linux apps. Icon/arrow templates transfer
+  (measured 0.995); text ones do not (DirectWrite vs FreeType).
+- **Copilot Desktop login unresolved** — operator could not complete sign-in; not a SOC defect and
+  not diagnosed further. Agent 1 could therefore not be calibrated against its real window.
+
+### Decisions
+
+- **Shim under pyautogui rather than rewriting 41 call sites.** SOC already treats pyautogui as a
+  seam (`_hands_wrap`), so a backend swap underneath keeps the hands guard intact and leaves the
+  Windows/X11 path byte-identical.
+- **`position()` returns the last position SOC set, and says so.** Wayland has no protocol to
+  query the pointer, so it cannot track the operator's physical mouse — nothing on Wayland can.
+  SOC already copes (`install_input_hook` returns False and it falls back to its own watcher),
+  which is why this is safe rather than quietly wrong.
+- **`focus_agent` returns False honestly on Wayland.** No protocol can raise another client's
+  window. Every caller proceeds regardless, which is correct here — clicks are aimed by locating
+  the window visually, so they land on the right pixels focused or not.
+- Anything needing another application's window is **not** shimmed (see
+  `WaylandPlatform.UNSUPPORTED`); those callers must use `wayland_agents.AgentWindow`.
+
+### Environment traps found (cost several hours; all confirmed)
+
+- **`GDK_BACKEND=x11`** — VS Code's extension host exports it to every child, silently forcing GTK
+  apps onto XWayland. A "native Wayland" test target launched from an agent shell is not native at
+  all. Detect with `xdotool search --name`: a genuinely native window returns nothing.
+- **`ELECTRON_RUN_AS_NODE=1`** — same origin; makes any Electron binary behave as plain Node and
+  reject its own launcher's Chromium flags (`bad option: --no-sandbox`), which looks exactly like
+  broken packaging.
+- **Never launch a long-lived GUI app with stdout redirected from a tool-call shell.** The shell is
+  torn down, the descriptor dies with it, and the app crashes on its next `console.log` with
+  `EBADF: bad file descriptor, write` — indistinguishable from an app bug. Use
+  `systemd-run --user --collect --unit=<name> <app>`.
+- **NVIDIA 595 + Chromium** — Copilot Desktop rendered a white window until launched with
+  `--disable-gpu`. Same driver family as the GTK4 Vulkan SEGV fixed earlier with `GSK_RENDERER=gl`.
+  A user-level entry at `~/.local/share/applications/copilot-desktop_copilot-desktop.desktop`
+  shadows the snap's and adds the flag; delete that one file to revert.
+- **Piping a harness's stdout to `tail`/`grep` can hang forever** if it spawns a child that
+  inherits the write end — a finished run looks stalled. Redirect to a file.
+
+### Open Stubs
+
+None introduced. `WaylandPlatform.UNSUPPORTED` is declared capability reporting, not a stub —
+callers check `supports()`.
+
+### Verification
+
+- `pytest tests/ -q` → **137 passed** (3 new: the calibration marker guard).
+- `soc_port/verify_agent_loop.py` → **11/11** on a native Wayland window.
+- `soc_port/verify_wayland_shims.py` → **7/7**, proven by observed effect (typed text had to
+  appear in a file written by the target window).
+- `soc_port/parity_x11_nowm.py` → **19 passed, 0 failed** — X11 path unregressed.
+- **Live UI check on the real desktop, SOC running under `SOC_PLATFORM=wayland`:** Set Win opened
+  the portal picker; the preview dialog rendered the captured window; the operator cancelled a
+  wrong window and the result was `window: not set`, **no reference written**, refused capture kept
+  at `agent1_rejected.png`. The reject path is verified by the operator against a genuinely wrong
+  window, not by a synthetic fixture.
+
 ## [2026-08-02] — **MAJOR: half the template library was invisible on Linux.** Case-sensitive `glob("*.png")` hid 20 of 40 templates. Fixed + regression-tested; 123/123 green
 
 ### The bug
