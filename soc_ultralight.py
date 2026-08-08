@@ -9228,7 +9228,21 @@ if __name__ == "__main__":
         messagebox.showerror("SOC Ultralight", "SOC Ultralight is already running.")
         sys.exit(1)
 
-    root = tk.Tk()
+    # className sets WM_CLASS, the Linux counterpart to the App ID above: GNOME
+    # matches it against StartupWMClass= in soc-ultralight.desktop to give the
+    # window its dash/alt-tab icon. Tk defaults to the generic "tk"/"Tk", which
+    # SOC Master Widget (also Tk) would collide with.
+    root = tk.Tk(className="soc-ultralight")
+    # Tk keeps no reference to a PhotoImage, so this is held on root: a local
+    # would be garbage-collected and the icon would blank out. iconbitmap() is
+    # not usable here — on X11 it wants an XBM, not the Windows .ico.
+    _icon_png = Path(__file__).resolve().parent / "assets" / "soc-ultralight.png"
+    if os.name != "nt" and _icon_png.is_file():
+        try:
+            root._icon_img = tk.PhotoImage(file=str(_icon_png))
+            root.iconphoto(True, root._icon_img)
+        except Exception:
+            pass               # icon is cosmetic — never block startup
     app = SOCUltralight(root)
     root.mainloop()
     sys.exit(0)

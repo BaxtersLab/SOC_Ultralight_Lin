@@ -14,6 +14,50 @@ set -euo pipefail
 
 cd "$(dirname "$(readlink -f "$0")")"
 
+# ── Snap contamination scrub — MUST run before any python is invoked ─────────
+#
+# Same block as Baxters_Ai_Hot_Rod_Tuner/run.sh and SOC_Master_Widget/run.sh.
+# It is FIRST because the venv bootstrap below calls `python3 -m venv`, and a
+# snap-owned LOCPATH kills that interpreter outright, before SOC's own code
+# runs at all:
+#   symbol lookup error: ... undefined symbol: __libc_pthread_init
+# It points into the snap's locales, built against a different glibc.
+#
+# Launching from the GNOME app grid gives a clean environment, so this path is
+# quiet there; it earns its place when SOC is started from a VS Code terminal,
+# which on this box leaks 18 of these (measured 2026-08-07).
+#
+# Scrub by rule, not by a hand-picked list — the two loops catch different
+# shapes: values that START with /snap/ (first loop, found by scanning env) and
+# values under $HOME/snap/ (second loop; they start with /home/, so the first
+# loop never sees them). XDG_DATA_DIRS is FILTERED rather than unset: it
+# legitimately holds the system's icon and .desktop paths, and unsetting it
+# would hide SOC's own desktop entry from the shell. /var/lib/snapd/desktop is
+# snapd, not /snap/, and is kept.
+#
+# tests/test_run_sh_scrub.py executes this block — it is not just documented.
+# (scrub:begin)
+for _var in $(env | grep -o '^[A-Za-z_][A-Za-z0-9_]*=/snap/[^:]*' | cut -d= -f1); do
+    [[ "$_var" == "XDG_DATA_DIRS" ]] && continue
+    unset "$_var"
+done
+for _var in GSETTINGS_SCHEMA_DIR GTK_PATH GTK_IM_MODULE_FILE GTK_EXE_PREFIX \
+            GIO_MODULE_DIR LOCPATH GDK_PIXBUF_MODULEDIR GDK_PIXBUF_MODULE_FILE \
+            XDG_DATA_HOME XDG_CONFIG_HOME XDG_CACHE_HOME; do
+    [[ "${!_var:-}" == *"/snap/"* ]] && unset "$_var"
+done
+unset _var
+if [[ "${XDG_DATA_DIRS:-}" == *"/snap/"* ]]; then
+    _clean=""
+    IFS=':' read -ra _parts <<< "$XDG_DATA_DIRS"
+    for _p in "${_parts[@]}"; do
+        [[ -z "$_p" || "$_p" == */snap/* ]] && continue
+        _clean="${_clean:+$_clean:}$_p"
+    done
+    export XDG_DATA_DIRS="${_clean:-/usr/local/share:/usr/share}"
+    unset _clean _parts _p
+fi
+# (scrub:end)
 
 # ── Backend selection ────────────────────────────────────────────────────────
 # An explicit SOC_PLATFORM always wins, so the escape hatch still works:

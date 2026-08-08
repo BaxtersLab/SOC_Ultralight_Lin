@@ -2,6 +2,126 @@
 
 _Append-only (Article VIII). Newest entry at the top._
 
+## [2026-08-07] — Snap scrub added to `run.sh` (it had none), and the block is now **executed** by a test rather than trusted
+
+Follow-on to the entry below, at operator instruction. `run.sh` cleared only
+`GDK_BACKEND` / `ELECTRON_RUN_AS_NODE`; it had no snap scrub, so starting SOC
+from a VS Code terminal ran the venv bootstrap under a snap-owned `LOCPATH`.
+Added the same block HRT and the Master Widget carry, placed **first** — before
+`python3 -m venv`, since that is the interpreter `LOCPATH` kills.
+
+**The scrub is shell, and shell was the one thing here nothing tested.** A typo
+in it surfaces only as `symbol lookup error: undefined symbol:
+__libc_pthread_init` at launch, which reads like a Python bug. So
+`tests/test_run_sh_scrub.py` does not grep for variable names: it cuts the
+shipped block out of `run.sh` between `# (scrub:begin)` / `# (scrub:end)`, runs
+it under bash with a real contaminated environment, and asserts on what
+survives. Same file added to the Master Widget, whose copy was equally untested
+and higher-stakes — it spawns the other three apps, so its environment is
+theirs.
+
+**A test I wrote was asserting something false.** `test_no_variable_still_points
+_into_a_snap` claimed nothing snap-pointing survives. The live launch showed six
+survivors that are correct: `SNAP*` (inert strings), `VSCODE_NLS_CONFIG` (read
+only by VS Code), and `PATH` — where `/snap/bin` is *wanted*, per CLAUDE.md's
+"PATH needs no blanket removal". The test only passed because its fake
+environment omitted them. Renamed to `..._no_loader_variable_...`, given an
+explicit `INERT` allowlist with the reason each is inert, and its environment
+extended to include the real survivors.
+
+Also corrected the Master Widget's "leaks 21 of these" comment: 18 measured
+today. The count moves with the extension set — it is now written as ~20 with
+both measurements, not a fixed number.
+
+### Traps hit
+
+- **`text.index("python3")` found the word in the scrub's own comment**, which
+  explains why it runs before `python3 -m venv`. The ordering test reported the
+  block as coming after itself. It now strips comment lines first.
+
+### Open Stubs
+
+None introduced.
+
+### Verification
+
+* `pytest tests/` → **153 passed, 19 subtests** (140 before; +13 scrub tests).
+* Master Widget `pytest` → **50 passed, 8 skipped** (37 before; +13).
+* **Proven to fail first.** Against the pre-fix `run.sh` the suite gave 13
+  errors (no markers → no block to execute).
+* **Mutation-checked twice, since a scrub test that cannot fail is worthless.**
+  Moving the block after the venv bootstrap → the ordering test fails alone.
+  Dropping `GTK_IM_MODULE_FILE` from the explicit list → 2 fail. Its real value
+  lives under `$HOME/snap/`, so it starts with `/home/` and **only** the
+  explicit list catches it; the env-scanning loop never sees it. `run.sh`
+  restored byte-identical after each (`diff` clean).
+* **End-to-end under real contamination, which is the point of the change:**
+  launched `./run.sh` from this session's VS Code shell (18 snap variables,
+  `LOCPATH=/snap/code/254/usr/lib/locale`). SOC's window was up in ~1 s, and
+  `/proc/<pid>/environ` shows all 9 fatal loader variables unset in the running
+  interpreter, with `XDG_DATA_DIRS` filtered to 5 legitimate entries —
+  `/var/lib/snapd/desktop` kept, no `/snap/` paths.
+
+## [2026-08-07] — Desktop entry + a real app icon: SOC was unlaunchable from the shell and had no mark of its own
+
+Operator reported SOC Ultralight and SOC Master Widget "do not have icons and a
+way to start the app". Both were true, and for different reasons per app.
+
+**SOC had no desktop entry at all.** `run.sh` existed (added 2026-08-03) but
+nothing published it to the shell, so SOC appeared nowhere in the app grid — the
+only way to start it was a terminal. Added `packaging/soc-ultralight.desktop`,
+installed to `~/.local/share/applications/`. `Exec=` points at `run.sh`, never
+`soc_ultralight.py`, for the backend-selection reason in the entry below.
+
+**SOC had no icon of its own.** `assets/ob_icon.ico` is the **outbox** mark
+("OB") — operator confirmed it was standing in, not the app icon. Added
+`packaging/generate_icon.py`, which draws a "SOC" mark in the house style
+measured off the sibling icons (tile `#010101`, glyph bbox 39,74–217,176 of
+256², white ink; Master Widget's mark is blue on the same tile, so SOC stays
+white to keep the two apart at dash size) and emits the 16–256 hicolor ladder.
+`ob_icon.ico` is untouched and still the outbox's.
+
+**Both apps are Tk, and Tk's default `WM_CLASS` is the generic `"tk"/"Tk"`** —
+measured with `xprop`. GNOME matches a window to its `.desktop` through
+`StartupWMClass`, so with the default class the shell cannot tell SOC from the
+Master Widget and one steals the other's identity. Fixed at the source:
+`tk.Tk(className="soc-ultralight")` in the entry point. Also set the window
+icon there via `iconphoto` — `iconbitmap()` is Windows-only for `.ico` (X11
+wants an XBM), which is why the existing call was a silent no-op on Linux.
+
+### Traps hit
+
+- **`xprop -root _NET_CLIENT_LIST` is not a reliable window census.** It missed
+  SOC's window for 55 s while the window was mapped and healthy —
+  `xwininfo -root -tree` found it immediately. Use the latter.
+- **`xprop _NET_WM_ICON` prints empty by default**, which reads as "no icon".
+  It is refusing to dump a 256² array, not reporting absence. Force the format:
+  `xprop -id ID -len 40 -f _NET_WM_ICON 32c ' $0+\n' _NET_WM_ICON`.
+- **`pkill -f soc_master_widget.py` killed the calling shell** (exit 144) — the
+  pattern matches the wrapper's own command line. Same trap already documented
+  for `Xvfb` at the bottom of this file; use the PID or the bracket form.
+
+### Open Stubs
+
+None introduced.
+
+### Verification
+
+* `pytest tests/` (venv interpreter) → **140 passed, 19 subtests passed**, 11.96 s.
+* `desktop-file-validate soc-ultralight.desktop` → clean.
+* `Gio.DesktopAppInfo.new("soc-ultralight.desktop")` under a **scrubbed** env →
+  name/icon/exec/`wm_class=soc-ultralight`/`should_show=True` all resolve.
+  Under this box's VS Code terminal env it returns NULL, because
+  `XDG_DATA_HOME` points into `/home/baxter/snap/code/254/.local/share` — an
+  18-variable snap leak, the documented contamination, not an install fault.
+* Launched **through the desktop entry** (`gio launch`), not by hand:
+  window `"SOC Ultralight"` mapped 250x796, `WM_CLASS = "soc-ultralight",
+  "Soc-ultralight"` — matches `StartupWMClass`.
+* Icon proven **live on the window**, not merely on disk: `_NET_WM_ICON` reads
+  `256, 256, 4278255873, …`, byte-identical to the new PNG's ARGB pixels, and
+  the process (13:33:33) postdates the icon file (13:32:59).
+* Legibility checked by eye at 48 px, the dash size.
+
 ## [2026-08-03] — Auto-click root cause: **the Wayland backend was never selected at launch**
 
 Operator reported auto-click still not working after the template fixes. The
