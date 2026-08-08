@@ -2,6 +2,64 @@
 
 _Append-only (Article VIII). Newest entry at the top._
 
+## [2026-08-03] — Auto-click root cause: **the Wayland backend was never selected at launch**
+
+Operator reported auto-click still not working after the template fixes. The
+templates were not the problem, and neither was the matching. **SOC was running
+the x11 backend on a Wayland session.**
+
+`platform_layer.get_platform()` deliberately does not auto-select the Wayland
+backend — it requires `SOC_PLATFORM=wayland`, and `wayland_shims.install()`
+gates on the same variable. There was **no Linux launcher in the repo** (only
+`run.bat` / `run_isolated.bat`), and the Master Widget registry started SOC with
+a bare `./.venv/bin/python soc_ultralight.py`. Nothing anywhere set the variable.
+Every prior verification in this file was run with it exported by hand, which is
+why the port looked finished while the shipped launch path was broken.
+
+Measured on this box, same machine, same moment:
+
+| launch | backend | desktop capture |
+| --- | --- | --- |
+| `python soc_ultralight.py` | `x11` | **mean 0.00, stdev 0.00 — pure black** |
+| `SOC_PLATFORM=wayland …`   | `wayland` | mean 58.08, stdev 74.53 |
+
+Template matching against a uniformly black frame matches nothing, forever, and
+raises no error. `pyautogui`'s XTEST clicks go to XWayland, which the compositor
+never forwards to native Wayland clients. The feature therefore ran, logged
+nothing wrong, and did nothing — the worst available failure mode.
+
+### Fixed
+
+* **`run.sh`** (new) — picks the backend from the live session
+  (`XDG_SESSION_TYPE` / `WAYLAND_DISPLAY`), respecting an explicit
+  `SOC_PLATFORM` so `SOC_PLATFORM=x11 ./run.sh` still forces the old path. Also
+  unsets `GDK_BACKEND` and `ELECTRON_RUN_AS_NODE`, which VS Code exports into
+  every terminal it spawns, and carries over run.bat's V-plugin probe and
+  `py_compile` check (using Python for the probe — curl is not installed here).
+* **Master Widget registry** now launches SOC via `./run.sh`, with the reason
+  recorded in the entry's note so it is not "tidied" back to a bare python call.
+* **Loud startup banner** when the x11 backend is loaded on a Wayland session,
+  on stderr, plus the same warning in the SOC log pane when the operator presses
+  Scan — stderr is discarded when the Master Widget launches with
+  `console: false`, which is exactly how this went unnoticed.
+* **Blank-capture detection in `_autoclick_loop`.** If a captured frame has
+  `stdev < 1.0` it is not a desktop; the loop now says so once per scan, with
+  the measured mean/stdev, backend name and session type, instead of spinning
+  silently. This catches the failure *condition* rather than a proxy for it, so
+  it still fires if capture dies for some other reason.
+
+### Verified
+
+* `wayland_shims.install()` → True; `pyautogui.click`, `pyautogui.position` and
+  `PIL.ImageGrab.grab` all rerouted to `platform_layer.wayland_shims`.
+* Portal capture returns real pixels (mean 58.08) with the cached restore
+  token — no permission prompt.
+* `py_compile` clean; **156 passed, 19 subtests passed**.
+* Master Widget: 37 passed, 8 skipped; all 5 registry entries resolve.
+* NOT verified: an actual template click landing on a target window. That needs
+  the operator to enable a template and watch it fire — the capture and
+  injection paths are both proven, the end-to-end click is not.
+
 ## [2026-08-03] — **SOC runs on Wayland.** Full agent loop verified 11/11 on a native Wayland window; Set Win calibration UI replaced; 137 tests green
 
 Commits `2dfe2df` → `359d2e7` → `58e81ae`, pushed to `BaxtersLab/SOC_Ultralight_Lin`.

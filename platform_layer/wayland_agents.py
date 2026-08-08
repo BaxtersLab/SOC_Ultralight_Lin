@@ -95,10 +95,20 @@ class WaylandDesktop:
     Exactly one PipeWire stream may exist at a time (see module docstring), and
     this is it. `suspended()` releases it so calibration can briefly open a
     window session, and restores it afterwards.
+
+    CURSOR_HIDDEN, not the portal's CURSOR_EMBEDDED default: the compositor
+    composites the pointer INTO the frame otherwise, so a button with the mouse
+    resting on it no longer matches its template. Auto-click made that
+    self-inflicting — it moves the pointer onto a target to click it, and the
+    pointer then sits there occluding the very thing the next scan looks for.
+    Hiding it at the source beats masking it afterwards: there is no cursor in
+    the pixels to begin with, so template matching and OCR both see the clean
+    surface. The operator's own on-screen pointer is unaffected; this changes
+    only what our capture stream contains.
     """
 
     def __init__(self):
-        self._session = RemoteDesktopSession()
+        self._session = RemoteDesktopSession(cursor_mode=CURSOR_HIDDEN)
 
     # capture ---------------------------------------------------------------
 
@@ -143,7 +153,7 @@ class WaylandDesktop:
             self._session.close()
         except Exception:
             pass
-        self._session = RemoteDesktopSession()
+        self._session = RemoteDesktopSession(cursor_mode=CURSOR_HIDDEN)
 
     class _Suspended:
         def __init__(self, desktop):

@@ -72,8 +72,8 @@
     "action": "click"
   },
   "send_message_to_claude.png": {
-    "matches": 66,
-    "conf_sum": 59.97403126955032,
+    "matches": 68,
+    "conf_sum": 61.86093121767044,
     "trained": true,
     "action": "click",
     "deprecated": "Anthropic UI update 2026-06: replaced by Agent3_send_input_button.PNG + claude_geo_point.PNG hover-reveal flow"
@@ -85,8 +85,8 @@
     "action": "focus_paste"
   },
   "agent2_scroll_dn.png": {
-    "matches": 93,
-    "conf_sum": 90.9511907696724,
+    "matches": 97,
+    "conf_sum": 94.55487614870071,
     "trained": true,
     "action": "click"
   },
@@ -97,8 +97,8 @@
     "action": "click"
   },
   "send_message_to_agent2.png": {
-    "matches": 115,
-    "conf_sum": 103.10858750343323,
+    "matches": 117,
+    "conf_sum": 104.90560925006866,
     "trained": true,
     "action": "click"
   },
@@ -122,8 +122,8 @@
     "action": "click"
   },
   "agent3_send.png": {
-    "matches": 59,
-    "conf_sum": 56.488004982471466,
+    "matches": 61,
+    "conf_sum": 58.214236199855804,
     "trained": true,
     "action": "click"
   },
@@ -213,8 +213,8 @@
     "action": "click"
   },
   "claude_positive_indicator.png": {
-    "matches": 1,
-    "conf_sum": 0.998842716217041,
+    "matches": 2,
+    "conf_sum": 1.8194109201431274,
     "trained": false,
     "action": "click"
   },
@@ -227,6 +227,12 @@
   "agent5_scroll_up.png": {
     "matches": 1,
     "conf_sum": 0.8958224058151245,
+    "trained": false,
+    "action": "click"
+  },
+  "agent3_scroll_up.png": {
+    "matches": 1,
+    "conf_sum": 0.9302437901496887,
     "trained": false,
     "action": "click"
   }

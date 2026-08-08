@@ -231,6 +231,42 @@ try:
 except Exception as _exc:                        # never block startup on this
     print(f"[platform] Wayland shim NOT installed: {_exc}")
 
+
+def _warn_if_backend_mismatched():
+    """Shout when the x11 backend was selected on a live Wayland session.
+
+    This combination is not a degraded mode, it is a dead one: mss captures the
+    empty X root window (measured on this box: mean 0.00, stdev 0.00 — pure
+    black) and XTEST clicks go to XWayland, which the compositor never forwards
+    to native Wayland clients. Auto-click then matches templates against a black
+    frame, finds nothing, and reports no error — and the operator sees a feature
+    that "does not work" with nothing in the log to explain it.
+
+    The backend is opt-in via SOC_PLATFORM (see platform_layer.get_platform), so
+    the mismatch happens by omission, e.g. launching soc_ultralight.py directly
+    instead of through run.sh. Warn loudly rather than switch: window targeting
+    behaves differently between the two, so the choice stays the caller's.
+    """
+    session_is_wayland = (os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+                          or bool(os.environ.get("WAYLAND_DISPLAY")))
+    if session_is_wayland and PLATFORM.name != "wayland":
+        banner = (
+            "\n" + "!" * 78 + "\n"
+            "  SOC is on a WAYLAND session but loaded the "
+            f"'{PLATFORM.name}' backend.\n"
+            "  Screen capture will be BLACK and clicks will go nowhere.\n"
+            "  Auto-click, OCR and the agent loop cannot work in this state.\n"
+            "\n"
+            "  Fix: launch with ./run.sh  (or set SOC_PLATFORM=wayland)\n"
+            + "!" * 78 + "\n"
+        )
+        print(banner, file=sys.stderr)
+        return banner
+    return ""
+
+
+_BACKEND_MISMATCH_WARNING = _warn_if_backend_mismatched()
+
 for _hands_fn in ("click", "rightClick", "doubleClick", "tripleClick",
                   "moveTo", "moveRel", "dragTo", "dragRel",
                   "typewrite", "write", "hotkey", "press",
@@ -1437,6 +1473,7 @@ class SOCUltralight:
         self._autoclick_images:  list                     = []   # keep PhotoImage refs alive
         self._autoclick_running  = False
         self._autoclick_thread   = None
+        self._autoclick_blank_warned = False   # blank-capture warning is once-per-scan
         self._template_cache:    dict[str, tuple]         = {}   # stem → (mtime, cv2_ndarray)
         self._autoclick_panel_open = False   # collapsed by default
         self._training_stem: str | None = None  # stem currently being trained; None = idle
@@ -3379,10 +3416,26 @@ class SOCUltralight:
         x1 = max(0, x - TRAIN_CAPTURE_W // 2)
         y1 = max(0, y - TRAIN_CAPTURE_H // 2)
         try:
-            with _mss_ctor() as sct:
-                raw = sct.grab({"left": x1, "top": y1,
-                                "width": TRAIN_CAPTURE_W, "height": TRAIN_CAPTURE_H})
-                img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+            img = self._grab_region_rgb(x1, y1, TRAIN_CAPTURE_W, TRAIN_CAPTURE_H)
+
+            # Refuse to write a blank template. On Wayland an X11-backed grab
+            # returns a uniformly black image with no error, and saving it is
+            # worse than failing: the file lands as "<stem>.png" and, because
+            # ext4 is case-sensitive and the resolver prefers lowercase, it
+            # SHADOWS a working "<stem>.PNG" that was captured on Windows.
+            # A silent scan failure then becomes a destroyed template.
+            arr = np.array(img)
+            if arr.std() < 1.0:
+                self._training_stem = None
+                self._log(
+                    f"[train] ✗ '{stem}' NOT saved — the capture is blank "
+                    f"(mean={arr.mean():.2f}, stdev={arr.std():.2f}). "
+                    f"Backend '{PLATFORM.name}' on a "
+                    f"{os.environ.get('XDG_SESSION_TYPE', '?')} session; "
+                    f"launch via ./run.sh. Existing template left untouched.")
+                self.root.after(0, self.root.deiconify)
+                return
+
             out_path = TEMPLATE_DIR / f"{stem}.png"
             img.save(str(out_path))
             self._training_stem = None
@@ -3411,6 +3464,13 @@ class SOCUltralight:
             self._autoclick_running = True
             self._ac_scan_btn.config(text="■ Scanning", fg=RED)
             self._log("[auto-click] scan started")
+            if _BACKEND_MISMATCH_WARNING:
+                # The operator is starting the exact feature this breaks; say so
+                # here rather than only on stderr, which is discarded when SOC is
+                # launched from the Master Widget with console=false.
+                self._log("[auto-click] !! WAYLAND SESSION, "
+                          f"'{PLATFORM.name}' BACKEND — capture will be black and "
+                          "clicks go nowhere. Launch via ./run.sh")
             self._autoclick_thread = threading.Thread(
                 target=self._autoclick_loop, daemon=True)
             self._autoclick_thread.start()
@@ -3435,6 +3495,25 @@ class SOCUltralight:
             if p.stem.lower() == low:
                 return p
         return None
+
+    @staticmethod
+    def _grab_region_rgb(x1: int, y1: int, w: int, h: int):
+        """One screen rectangle as a PIL RGB image.
+
+        Template training used mss directly, which reads the X11 root window and
+        therefore returns solid black under Wayland — regardless of which SOC
+        backend is selected, because the Wayland shims cover pyautogui and
+        PIL.ImageGrab but not mss. On Wayland the frame comes from the portal
+        stream and is cropped here; the stream's origin is always (0, 0).
+        """
+        if PLATFORM.name == "wayland":
+            import io
+            from platform_layer.wayland_agents import desktop
+            full = Image.open(io.BytesIO(desktop().frame(fresh=True))).convert("RGB")
+            return full.crop((x1, y1, x1 + w, y1 + h))
+        with _mss_ctor() as sct:
+            raw = sct.grab({"left": x1, "top": y1, "width": w, "height": h})
+            return Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
 
     def _grab_desktop_bgr(self, sct):
         """Whole desktop as a BGR array, plus its screen-space origin.
@@ -3475,6 +3554,24 @@ class SOCUltralight:
                     enabled = set(self._autoclick_enabled)
                     if enabled:
                         screen_bgr, mon_left, mon_top = self._grab_desktop_bgr(sct)
+
+                        # A frame with no variance is not a desktop. This is what
+                        # an X11-backend capture returns on a Wayland session, and
+                        # matching against it silently finds nothing forever.
+                        # Report it once per scan instead of spinning in the dark.
+                        if screen_bgr.std() < 1.0:
+                            if not self._autoclick_blank_warned:
+                                self._autoclick_blank_warned = True
+                                self._log(
+                                    "[auto-click] ✗ desktop capture is blank "
+                                    f"(mean={screen_bgr.mean():.2f}, "
+                                    f"stdev={screen_bgr.std():.2f}) — nothing can "
+                                    f"ever match. Backend '{PLATFORM.name}' on a "
+                                    f"{os.environ.get('XDG_SESSION_TYPE', '?')} "
+                                    "session; launch via ./run.sh")
+                            time.sleep(AUTOCLICK_SCAN)
+                            continue
+                        self._autoclick_blank_warned = False
 
                         now = time.time()
                         for stem in enabled:
@@ -7803,10 +7900,14 @@ class SOCUltralight:
                 "        agent2_scroll_dn.png  agent2_scroll_up.png")
             return
         self._log(f"[cal] scanning screen against {len(templates)} templates…")
+        # Same portal dispatch the auto-click loop uses. Reading mss directly
+        # here captured the X11 root window, which is empty under Wayland, so
+        # every template scored exactly 0.00 against a black frame — including
+        # ones plainly visible on screen. Identical zeros across the whole
+        # library are the signature of that, not of a genuine miss.
         with _mss_ctor() as sct:
-            raw = sct.grab(sct.monitors[1])
-            screen_img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-        screen_gray = cv2.cvtColor(np.array(screen_img), cv2.COLOR_RGB2GRAY)
+            screen_bgr, cal_left, cal_top = self._grab_desktop_bgr(sct)
+        screen_gray = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2GRAY)
         found = 0
         for tpl_path in sorted(templates):
             tpl = self._safe_imread(tpl_path, cv2.IMREAD_GRAYSCALE)
