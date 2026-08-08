@@ -2,6 +2,48 @@
 
 _Append-only (Article VIII). Newest entry at the top._
 
+## [2026-08-08] — SOC's main window has **never** set an icon; mirror advisory written for the Windows agent
+
+No SOC code changed here. Recording a finding and where the advisory lives.
+
+**The main window sets no icon on Windows, and never has.** Exhaustive search of
+the tree: `soc_ultralight.py` contains no `iconbitmap` call at all. The only
+icon call anywhere is `plugins/v_plugin/v_plugin.py:475`:
+
+```python
+self._win.iconbitmap(default=str(_ico))     # a4v_icon.ico
+```
+
+That is the **`default=`** form, which on Windows sets the icon for *every*
+toplevel in the process, including later ones. So on the Windows fork SOC's
+main window shows either the **A4v plugin's** icon (if the plugin loaded) or
+the bare **pythonw** icon (if it did not) — decided by plugin load order.
+Neither is deliberate. The comment at `soc_ultralight.py:9220` says the
+AppUserModelID is declared so Windows will "honour each window's iconbitmap",
+but the main window has none to honour.
+
+This only surfaced because the Linux side now sets `iconphoto` explicitly and
+the asymmetry became visible. The Linux path is unaffected — `iconbitmap` is
+Windows-only for `.ico` and stays behind an `os.name` check.
+
+Not fixed here: the Windows entry point is in a different repo
+(`BaxtersLab2/SOC_Ultralight`, a **different account** from this fork's
+`BaxtersLab/SOC_Ultralight_Lin`), and per the ownership boundary that is the
+Windows agent's tree. Written up for them instead, with the asset generated so
+it is a drop-in rather than a task.
+
+### Advisory location
+
+`/run/media/baxter/USB321FD/soc ultralight mirror advisory/` — `INDEX.md`,
+`SOC_MIRROR_ADVISORY.md`, `soc-ultralight.ico` (7 sizes, 16→256),
+`soc-ultralight-256.png`, `generate_icon.py`. Separate from
+`windows agent handoff/` (the 2026-08-04 port list); neither supersedes the
+other, and they must not be merged.
+
+Reminder recorded there and here: **`assets/ob_icon.ico` is the OUTBOX mark**,
+not an app icon. It was standing in as one. `packaging/generate_icon.py` draws
+the real "SOC" mark.
+
 ## [2026-08-07] — Snap scrub added to `run.sh` (it had none), and the block is now **executed** by a test rather than trusted
 
 Follow-on to the entry below, at operator instruction. `run.sh` cleared only
