@@ -53,6 +53,29 @@ fault; it is a dependency one.
 launch rather than only at venv creation, since an existing venv may already be
 poisoned. No-op once clean. Commit `e1d810b`.
 
+### Known flaky test — environmental, NOT a regression
+
+`HandsGuardTests::test_worker_thread_waits_until_operator_idle` fails
+intermittently: **1 in 3 full-suite runs** here, but 8/8 green in isolation.
+Failure is always `gate thread never released` — the thread is still alive
+after a 15 s join when the expected wait is ~0.9 s.
+
+Cause: `_hands_watcher()` (soc_ultralight.py:143) polls the **real cursor at
+5 Hz for the process lifetime**, and any movement attributed to a human sets
+`operator_until = now + HANDS_OPERATOR_COOLOFF` (8.0 s). Continued movement
+re-extends it, so the gate never opens inside the 15 s timeout. **Moving the
+mouse while the suite runs fails this test.** It failed here while GUI apps
+were being launched and killed for verification.
+
+Pre-existing — observed on the OLD folder and OLD venv earlier the same day,
+before the re-clone and before the xlib repair, so neither caused it.
+
+Not fixed: the test guards operator-safety behaviour and the fix belongs with
+the operator's sign-off. The fix is test isolation — neutralise
+`_hands_move_is_operator` (or stop the watcher) for the duration, so the test
+exercises the gate rather than the room. Run the suite with hands off the mouse
+until then.
+
 ### Trap for the next session
 
 **A green suite on this box is not evidence a fresh clone works.** The venv here
