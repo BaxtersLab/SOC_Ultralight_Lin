@@ -85,6 +85,29 @@ if [[ ! -x "$PY" ]]; then
     "$PY" -m pip install --quiet -r requirements.txt
 fi
 
+# ── python3-xlib shadow repair ───────────────────────────────────────────────
+#
+# pyautogui declares `python3-Xlib` on Linux. That is an ancient (0.15) fork
+# which installs the SAME `Xlib` package directory as python-xlib (0.33), so
+# whichever pip writes last wins — and on a fresh `pip install -r
+# requirements.txt` it is the 0.15 one. 0.15 cannot do the modern Xauthority
+# handshake, so the x11 backend dies with
+#   Xlib.error.DisplayConnectionError: Can't connect to display ":0":
+#   Authorization required, but no authorization protocol specified
+# which reads like a display/permissions fault and is really a dependency one.
+#
+# Found 2026-08-09 by re-cloning the repo: the long-lived venv on this box had
+# never installed either package (it inherited apt's python3-xlib 0.33 through
+# --system-site-packages), so the bug was invisible until a clean checkout.
+#
+# Repaired on every launch, not just at creation — an existing venv may already
+# be poisoned, and the check is a no-op once it is clean.
+if "$PY" -m pip show python3-xlib >/dev/null 2>&1; then
+    echo "[soc] Removing python3-xlib 0.15 — it shadows python-xlib 0.33…"
+    "$PY" -m pip uninstall -y --quiet python3-xlib
+    "$PY" -m pip install --quiet --force-reinstall python-xlib
+fi
+
 # ── V plugin check (parity with run.bat) ─────────────────────────────────────
 # Warn if no VLM server is reachable, but never block — Agent 4 simply stays
 # offline. curl is not installed by default on this box, so this uses Python.
