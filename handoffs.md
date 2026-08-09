@@ -2,6 +2,91 @@
 
 _Append-only (Article VIII). Newest entry at the top._
 
+## [2026-08-09] — **Repository rebuilt** to drop two desktop screenshots; re-cloning exposed a fresh-install bug that had been invisible for the whole port
+
+Operator deleted the public repo and had this box push a sanitized rebuild.
+
+### Why a rebuild rather than a file removal
+
+`docs/images/desktop_layout_2agent.PNG` and `_3agent.PNG` were full 1920x1080
+captures of the real screen — readable chat text across three windows, a file
+listing, the taskbar and the account name. Removing them going forward would
+have left them reachable in the old commits, so history was restarted at a
+single clean commit (`08ae2d1`).
+
+Kept deliberately: **`banner.png` is designed artwork, not a capture**, and the
+**46 `buttons database` crops are assets** — SOC's template matching needs them
+and they are UI fragments, largest 251x41. An earlier draft of the question
+wrongly lumped banner.png in with the captures; corrected before pushing.
+
+`README.md` embedded both captures, so removing the files would have left broken
+images. Replaced with box-drawing diagrams of the 2- and 3-agent layouts, which
+document what SOC actually needs visible (input field, send button, scroll
+control) rather than a moment on someone's desktop. `.gitignore` now blocks
+`docs/images/desktop_layout_*`.
+
+### What the re-clone caught — the real find
+
+The workspace was re-cloned from the new repo to guarantee no dirty history
+survived locally. **The first `pytest tests/` on that fresh checkout could not
+even collect:**
+
+```
+Xlib.error.DisplayConnectionError: Can't connect to display ":0":
+Authorization required, but no authorization protocol specified
+```
+
+Cause: **pyautogui declares `python3-Xlib` on Linux** — an ancient (0.15) fork
+that installs the SAME `Xlib` package directory as `python-xlib` (0.33). Both
+were pulled in; whichever pip writes last wins, and on a clean
+`pip install -r requirements.txt` that is 0.15, which cannot do the modern
+Xauthority handshake.
+
+**This had been broken for every fresh install for the entire port and nobody
+could have seen it.** The long-lived venv on this box never installed either
+package — it inherited apt's `python3-xlib 0.33` through
+`--system-site-packages`, so every previous "153 passed" was run against a venv
+that a fresh clone does not reproduce. It reads like a display or permissions
+fault; it is a dependency one.
+
+`run.sh` now removes the shadow and reinstalls `python-xlib`, on **every**
+launch rather than only at venv creation, since an existing venv may already be
+poisoned. No-op once clean. Commit `e1d810b`.
+
+### Trap for the next session
+
+**A green suite on this box is not evidence a fresh clone works.** The venv here
+predates most of the port and silently supplies system packages that
+`requirements.txt` would otherwise install badly. Re-clone into a scratch dir
+and build the venv from nothing before believing an install path.
+
+### Verification
+
+* Sanitized commit audited before pushing: 0 objects matching `desktop_layout`,
+  0 matching any gitignored runtime path, 1 commit, 131 files.
+* Confirmed against the live GitHub API after pushing: `docs/images/` contains
+  only `.gitkeep` and `banner.png`.
+* **`.venv` deleted entirely and rebuilt by `run.sh`**: the repair fired, Xlib
+  resolves to 0.33, `display.Display()` connects to `:0`, SOC's window mapped
+  with `WM_CLASS soc-ultralight`, **153 passed, 19 subtests**.
+* Calibration carried across the re-clone byte-identical (`config.json`, all
+  agent sections). `buttons database/registry.json` differs only in match
+  counters, which the verification run itself incremented — 39 template entries
+  both sides.
+* Desktop entry still resolves to an existing `run.sh`; Master Widget still
+  reports SOC and Timer Prompt READY as siblings; launched through the
+  `.desktop` entry.
+
+### Cleanup
+
+Old 12-commit workspace copy deleted after the above passed. The file-cabinet
+copy carried a **stale `.git` pointing at the live remote with the captures in
+its objects** — a force-push from there would have re-published them; removed,
+and its files refreshed from the verified clone. The captures are gone from
+workspace and file cabinet; they remain in the dated
+`My Passport/file cabinet backup 8-6-25` snapshot, which was deliberately not
+touched.
+
 ## [2026-08-08] — SOC's main window has **never** set an icon; mirror advisory written for the Windows agent
 
 No SOC code changed here. Recording a finding and where the advisory lives.
