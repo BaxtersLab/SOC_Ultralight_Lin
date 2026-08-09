@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=SOC Ultralight
+GenericName=Swarm Orchestrator
+Comment=Multi-agent screen orchestration with OCR and template auto-click
+# Must be run.sh, never soc_ultralight.py directly: platform_layer.get_platform()
+# does not auto-select the Wayland backend, so a bare launch gets the x11 one,
+# whose capture on this session is pure black and whose XTEST clicks cannot
+# reach native Wayland clients — auto-click then matches nothing, silently.
+Exec=/home/baxter/workspace/SOC_Ultralight/run.sh
+TryExec=/home/baxter/workspace/SOC_Ultralight/run.sh
+Path=/home/baxter/workspace/SOC_Ultralight
+Icon=soc-ultralight
+Terminal=false
+Categories=Utility;
+Keywords=soc;swarm;ocr;automation;agents;orchestrator;
+StartupNotify=true
+# Tk sets WM_CLASS from tk.Tk(className=…) in soc_ultralight.py's entry point.
+StartupWMClass=soc-ultralight

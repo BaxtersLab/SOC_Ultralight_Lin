@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Desktop-layout screenshots — full 1920x1080 captures of the operator's real
+# screen. Readable chat text, a file listing, the taskbar and the account name
+# were all visible. The README documents the layout as a diagram instead.
+# Do not re-add a screenshot here; describe or crop tightly instead.
+docs/images/desktop_layout_*.PNG
+docs/images/desktop_layout_*.png
+
+# SOC runtime artifacts (generated at run time, machine-specific)
+config.json
+.soc_alive
+soc_control.signal
+data_log/
+outbox/
+sent/
+staging/
+transcript/
