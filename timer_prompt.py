@@ -50,6 +50,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import tkinter as tk
 
@@ -70,6 +71,8 @@ except Exception:                                          # pragma: no cover
     pyperclip = None
 
 # ── Colours (matched to VS Mic Widget so the cluster looks like one suite) ────
+ICON_DIR = Path(__file__).resolve().parent / "assets"
+
 BG      = "#1e1e1e"
 BG2     = "#2d2d2d"
 FG      = "#d4d4d4"
@@ -115,10 +118,41 @@ class TimerPrompt:
         self._tick()
 
     # ── window ───────────────────────────────────────────────────────────────
+    def _set_icon(self):
+        """Put the clock on the window itself.
+
+        Without this the shell falls back to a generic gear: Timer Prompt set
+        no window icon at all, so there was no _NET_WM_ICON for the taskbar to
+        read. A launcher's Icon= key alone does not fix that -- it dresses the
+        dash entry, not the mapped window.
+
+        Several sizes are handed over so the compositor picks the right one
+        rather than rescaling 256px down to 24.
+        """
+        icons = []
+        for size in (256, 128, 64, 48, 32, 24, 16):
+            f = ICON_DIR / f"timer-prompt-{size}.png"
+            if f.exists():
+                try:
+                    icons.append(tk.PhotoImage(file=str(f)))
+                except tk.TclError:
+                    pass
+        if icons:
+            self.root.iconphoto(True, *icons)
+            self.root._icon_refs = icons     # Tk keeps no reference of its own
+        return bool(icons)
+
     def _build_window(self):
         self.root.title("Timer Prompt")
+        self._set_icon()
         self.root.attributes("-topmost", True)
-        self.root.overrideredirect(True)
+        # NOT overrideredirect: on this box's compositor (Mutter/XWayland) an
+        # override-redirect window is never handed keyboard input — confirmed
+        # by zero KeyPress events reaching even a bind_all handler, and no
+        # client-side focus_force()/grab_set() can override that. A normal,
+        # WM-managed window is the only way the h/m/grace/x/y entries can
+        # actually receive typed digits. Costs the borderless look; the
+        # drag-bar below still works as a custom title area.
         self.root.configure(bg=BG)
         self.root.resizable(False, False)
         w, h = 236, 250
@@ -490,7 +524,10 @@ class TimerPrompt:
 
 
 def main():
-    root = tk.Tk()
+    # className becomes WM_CLASS, which is what StartupWMClass in the .desktop
+    # file matches. Bare tk.Tk() yields WM_CLASS "Tk", so the window never
+    # associates with its launcher and the shell shows a generic icon.
+    root = tk.Tk(className="timer-prompt")
     TimerPrompt(root)
     root.mainloop()
 
