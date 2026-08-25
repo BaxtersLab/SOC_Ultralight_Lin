@@ -419,6 +419,7 @@ REGISTRY_FILE = TEMPLATE_DIR / "registry.json"  # per-template match history
 
 AUTOCLICK_SCAN     = 1.5   # seconds between auto-click scans
 AUTOCLICK_COOLDOWN = 3.0   # seconds before re-clicking the same button
+AUTOCLICK_REPORT_EVERY = 12.0  # seconds between "still scanning, best score" lines
 
 
 def template_pngs(directory=None):
@@ -439,12 +440,23 @@ def template_pngs(directory=None):
     Sub-directories are skipped, so "buttons database/_retired_blank" stays out.
     """
     d = directory if directory is not None else TEMPLATE_DIR
+    found = []
     try:
-        return sorted((p for p in d.iterdir()
-                       if p.is_file() and p.suffix.lower() == ".png"),
-                      key=lambda p: p.name.lower())
+        found = [p for p in d.iterdir()
+                 if p.is_file() and p.suffix.lower() == ".png"]
     except OSError:
         return []
+    # `private/` is scanned too, but only when it IS the default library --
+    # an explicit `directory` argument means the caller asked for exactly that
+    # one. It is git-ignored wholesale, so a crop the operator does not want
+    # published can sit beside the others and still be usable here.
+    if directory is None:
+        try:
+            found += [p for p in PRIVATE_TEMPLATE_DIR.iterdir()
+                      if p.is_file() and p.suffix.lower() == ".png"]
+        except OSError:
+            pass
+    return sorted(found, key=lambda p: p.name.lower())
 
 
 TRAIN_CAPTURE_W = 150   # px width  — region saved when user clicks during training
@@ -463,6 +475,146 @@ AUTOCLICK_SEQUENCE = ("down_arrow", "copy_button", "copy_center")
 # used as backend anchors only (always active, never toggled by the user).
 # These are hidden entirely from the Auto-Click panel.
 AUTOCLICK_HIDDEN = ("geo_point", "geo_hover", "_landmark", "_scroll_indicator")
+
+# ── Guarded auto-click templates ─────────────────────────────────────────────
+# Most templates are safe to click on sight: the worst case is a stray click in
+# an app the operator already trusts. Some are not in that class -- a button
+# that grants access, authorises a payment, or confirms a destructive action
+# costs far more than one wrong click, and template matching alone cannot tell
+# a wanted prompt from an unwanted one. The pixels are identical either way.
+#
+# A guarded template therefore never clicks on a match alone. The match only
+# NOMINATES a candidate; an external verifier must also approve it.
+#
+# SOC deliberately ships no verifiers and knows nothing about what any of them
+# check. Verifiers are the operator's own policy: which applications matter,
+# what counts as proof, and what may be automated are site decisions, not
+# properties of a screen-automation tool. They load at run time from a
+# directory outside this repository, so an operator's policy is never
+# published alongside the tool that runs it.
+#
+# Fail CLOSED at every step. A pattern that matches but whose verifier is
+# missing, unloadable, or raises must NOT click -- otherwise a broken policy
+# silently downgrades to no policy, which is the worst outcome for the exact
+# templates this mechanism exists to protect.
+
+
+def _soc_conf_dir():
+    """`soc-ultralight/` under the real user config dir, snap leakage ignored.
+
+    This box leaks snap-owned XDG_* variables into every VS Code terminal. If
+    XDG_CONFIG_HOME is poisoned that way, SOC launched from such a terminal
+    would look for operator policy inside the snap tree and find none -- which,
+    for a fail-closed guard, silently blocks every guarded click instead. A
+    /snap/ value is contamination, not a preference. Legitimate values are
+    still honoured.
+    """
+    raw = os.environ.get("XDG_CONFIG_HOME") or ""
+    if not raw or "/snap/" in raw:
+        return Path.home() / ".config" / "soc-ultralight"
+    return Path(raw) / "soc-ultralight"
+
+
+_SOC_CONF_DIR = _soc_conf_dir()
+
+#: Operator-supplied verifiers. Outside the repo on purpose (see above).
+#: Layout:  guards/manifest.json  +  guards/<module>.py
+#:   manifest.json = [{"pattern": "<substring>", "module": "<name>",
+#:                     "callable": "<function>"}]
+#: The callable receives (screen_bgr, rect) and returns (allowed, reason).
+GUARD_DIR      = _SOC_CONF_DIR / "guards"
+GUARD_MANIFEST = GUARD_DIR / "manifest.json"
+
+#: Templates the operator does not want published. `buttons database/private/`
+#: is git-ignored wholesale and scanned like the main directory, so a sensitive
+#: crop can sit beside the others without ever entering version control.
+PRIVATE_TEMPLATE_DIR = TEMPLATE_DIR / "private"
+
+
+def load_guard_rules(path=None) -> list:
+    """Guard rules from the operator's manifest, or [] if there are none.
+
+    Read fresh on each use rather than cached, so amending or revoking a rule
+    takes effect at the next scan instead of at the next SOC restart.
+
+    A malformed manifest yields NO rules, i.e. nothing is guarded -- which is
+    why `guard_error()` exists to report it loudly. Silence would let one typo
+    disarm every guard at once.
+    """
+    p = Path(path) if path is not None else GUARD_MANIFEST
+    try:
+        data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError, TypeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    out = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        pat  = str(entry.get("pattern", "")).strip().lower()
+        mod  = str(entry.get("module", "")).strip()
+        call = str(entry.get("callable", "")).strip()
+        if pat and mod and call:
+            out.append({"pattern": pat, "module": mod, "callable": call})
+    return out
+
+
+def guard_error(path=None) -> str:
+    """Why the manifest yielded no usable rules, or "" if it is fine/absent."""
+    p = Path(path) if path is not None else GUARD_MANIFEST
+    if not p.exists():
+        return ""
+    try:
+        data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError, TypeError) as e:
+        return f"guard manifest unreadable ({type(e).__name__}) - NOTHING is guarded"
+    if not isinstance(data, list):
+        return "guard manifest must be a JSON list - NOTHING is guarded"
+    if len(data) != len(load_guard_rules(p)):
+        return "some guard rules lack pattern/module/callable and were skipped"
+    return ""
+
+
+def guard_rule_for(stem: str, rules=None):
+    """The rule a template must satisfy before it may be clicked, or None.
+
+    Matched on a normalised stem so a hand-typed name still matches: the
+    operator names a template when capturing it, and a near-miss on case or
+    punctuation must not quietly downgrade a guarded button to an ordinary one.
+    """
+    rules = load_guard_rules() if rules is None else rules
+    flat = "".join(ch for ch in str(stem).lower() if ch.isalnum() or ch == "_")
+    for rule in rules:
+        pat = "".join(ch for ch in rule["pattern"] if ch.isalnum() or ch == "_")
+        if pat and pat in flat:
+            return rule
+    return None
+
+
+def load_guard_callable(rule):
+    """Import the verifier named by `rule`. Raises on any failure.
+
+    Raising rather than returning None is deliberate: the caller treats an
+    exception as a refusal, so a policy that cannot be loaded blocks the click
+    rather than allowing it.
+    """
+    import importlib.util
+    mod_path = GUARD_DIR / f"{rule['module']}.py"
+    if not mod_path.exists():
+        raise FileNotFoundError(f"guard module {mod_path} not found")
+    spec = importlib.util.spec_from_file_location(
+        f"_soc_guard_{rule['module']}", mod_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load guard module {mod_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    fn = getattr(mod, rule["callable"], None)
+    if not callable(fn):
+        raise AttributeError(
+            f"guard module {rule['module']} has no callable {rule['callable']!r}")
+    return fn
+
 
 for _d in [OUTBOX_DIR / "agent1", OUTBOX_DIR / "agent2", OUTBOX_DIR / "agent3",
            SENT_DIR   / "agent1", SENT_DIR   / "agent2", SENT_DIR   / "agent3",
@@ -1474,6 +1626,7 @@ class SOCUltralight:
         self._autoclick_running  = False
         self._autoclick_thread   = None
         self._autoclick_blank_warned = False   # blank-capture warning is once-per-scan
+        self._autoclick_last_report = 0.0      # epoch of last no-match score report
         self._template_cache:    dict[str, tuple]         = {}   # stem → (mtime, cv2_ndarray)
         self._autoclick_panel_open = False   # collapsed by default
         self._training_stem: str | None = None  # stem currently being trained; None = idle
@@ -3225,6 +3378,24 @@ class SOCUltralight:
             font=("Segoe UI", 8, "bold"), cursor="hand2", padx=6, bd=0)
         self._ac_scan_btn.pack(side="right", padx=(0, 4))
 
+        # Probe: score every enabled template against the screen RIGHT NOW and
+        # print the numbers. The scan loop only ever reported hits, so a
+        # template stuck just under the threshold looked identical to a dead
+        # loop. This is the tool for the moment the target IS on screen.
+        self._ac_probe_btn = tk.Button(
+            hdr, text="\u25c9 Probe", command=self._probe_autoclick_now,
+            bg=BG2, fg=YELLOW, relief="flat",
+            font=("Segoe UI", 8, "bold"), cursor="hand2", padx=6, bd=0)
+        self._ac_probe_btn.pack(side="right", padx=(0, 4))
+
+        # Capture a NEW template. `Train` only re-captures existing ones and
+        # cannot work on Wayland at all (see _grab_new_template).
+        self._ac_grab_btn = tk.Button(
+            hdr, text="\uff0b Grab", command=self._grab_new_template,
+            bg=BG2, fg=GREEN, relief="flat",
+            font=("Segoe UI", 8, "bold"), cursor="hand2", padx=6, bd=0)
+        self._ac_grab_btn.pack(side="right", padx=(0, 4))
+
         # Collapsible body — scrollable list of template rows
         self._ac_body = tk.Frame(parent, bg=BG)
         # _ac_body starts collapsed; opened via ▶ Auto-Click toggle
@@ -3452,6 +3623,229 @@ class SOCUltralight:
 
     # ── Auto-click scan loop ───────────────────────────────────────────────────
 
+    def _probe_autoclick_now(self):
+        """Score every enabled template against the current screen and report.
+
+        Answers the question the scan loop could not: is the template close and
+        just under the bar, or is nothing like it on screen at all? Runs off
+        the Tk thread because the frame grab costs ~1.6s on this box.
+        """
+        if not _CV2_OK:
+            self._set_status("opencv required for probe - pip install opencv-python")
+            return
+
+        def _work():
+            try:
+                enabled = sorted(self._autoclick_enabled)
+                if not enabled:
+                    self._log("[probe] no templates are enabled - tick one first")
+                    return
+                with _mss_ctor() as sct:
+                    screen_bgr, mon_left, mon_top = self._grab_desktop_bgr(sct)
+                if screen_bgr.std() < 1.0:
+                    self._log(f"[probe] capture is blank (stdev="
+                              f"{screen_bgr.std():.2f}) - backend "
+                              f"'{PLATFORM.name}'; launch via ./run.sh")
+                    return
+                self._log(f"[probe] {len(enabled)} enabled, threshold "
+                          f"{TEMPLATE_THRESH:.2f}, frame "
+                          f"{screen_bgr.shape[1]}x{screen_bgr.shape[0]}")
+                for stem in enabled:
+                    png = self._template_path(stem)
+                    if png is None:
+                        self._log(f"[probe]   {stem}: NO FILE (not in templates dir)")
+                        continue
+                    tmpl = self._load_template_cached(stem, png)
+                    if tmpl is None:
+                        self._log(f"[probe]   {stem}: unreadable by opencv")
+                        continue
+                    th, tw = tmpl.shape[:2]
+                    res = cv2.matchTemplate(screen_bgr, tmpl, cv2.TM_CCOEFF_NORMED)
+                    _, mv, _, ml = cv2.minMaxLoc(res)
+                    cx = ml[0] + tw // 2 + mon_left
+                    cy = ml[1] + th // 2 + mon_top
+                    if mv >= TEMPLATE_THRESH:
+                        verdict = "HIT - would click"
+                        _rule = guard_rule_for(stem)
+                        if _rule:
+                            try:
+                                ok, why = load_guard_callable(_rule)(
+                                    screen_bgr, (ml[0] + mon_left,
+                                                 ml[1] + mon_top, tw, th))
+                            except Exception as e:
+                                ok, why = False, f"{type(e).__name__}: {e}"
+                            verdict = (f"HIT, guard {'PASS' if ok else 'REFUSE'} - {why}")
+                    elif mv >= TEMPLATE_THRESH - 0.12:
+                        verdict = "near miss - re-capture this button on Linux"
+                    else:
+                        verdict = "not on screen (or wrong-OS template)"
+                    self._log(f"[probe]   {stem}: conf={mv:.3f} "
+                              f"{tw}x{th} @ ({cx},{cy}) - {verdict}")
+            except Exception as e:
+                self._log(f"[probe] error: {type(e).__name__}: {e}")
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    # ── Wayland-safe template capture ─────────────────────────────────────────
+
+    def _grab_new_template(self):
+        """Capture a NEW template by dragging a box over a screenshot.
+
+        WHY THIS EXISTS -- `Train` cannot work on Wayland
+        -------------------------------------------------
+        `_training_capture_loop` waits for the operator's physical click and
+        then crops around `PLATFORM.cursor_pos()`. On Wayland BOTH halves fail:
+
+          * `cursor_pos()` is in `WaylandPlatform.UNSUPPORTED` -- there is no
+            protocol to query the global pointer. It returns dead-reckoned
+            (0, 0), so the crop is taken from the screen's top-left corner
+            rather than from the button.
+          * `left_button_down()` needs `evdev` plus /dev/input access; without
+            it, it returns False forever and training simply times out.
+
+        Neither reports an error, so training on Wayland yields either nothing
+        or a template of the wrong pixels -- and a wrong template then never
+        matches, which is indistinguishable from the auto-click failure it was
+        meant to fix.
+
+        This path avoids the problem entirely: the only clicks it needs are
+        inside SOC's OWN window, where Tk delivers real coordinates. The desktop
+        arrives through the portal frame that already works.
+
+        Deliberately a normal, resizable Toplevel -- not fullscreen and not
+        `overrideredirect`. Article XIV: no unproven surface behaviour against
+        the live compositor, and this box's own Timer Prompt already proved
+        `overrideredirect` windows never get keyboard focus here.
+        """
+        from tkinter import simpledialog
+
+        raw = simpledialog.askstring(
+            "Capture template",
+            "Name for this template:\n\n"
+            "Names matching a rule in your guard manifest are verified\n"
+            "before they are ever clicked. Put crops you do not want\n"
+            "published in buttons database/private/.",
+            parent=self.root)
+        if not raw:
+            return
+        # Sanitise: this becomes a filename in the templates directory.
+        stem = "".join(c for c in raw.strip() if c.isalnum() or c in "_- ").strip()
+        stem = stem.replace(" ", "_")
+        if not stem:
+            self._set_status("template name must contain letters or digits")
+            return
+
+        rule = guard_rule_for(stem)
+        self._log(f"[grab] capturing '{stem}'"
+                  + (f" — GUARDED by rule '{rule['pattern']}'"
+                     if rule else ""))
+        self.root.withdraw()          # keep SOC out of its own screenshot
+
+        def _work():
+            try:
+                time.sleep(0.6)       # let the withdraw actually take effect
+                with _mss_ctor() as sct:
+                    screen_bgr, _, _ = self._grab_desktop_bgr(sct)
+                if screen_bgr is None or screen_bgr.std() < 1.0:
+                    self._log("[grab] ✗ capture is blank — launch via ./run.sh")
+                    return
+                rgb = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2RGB)
+                self.root.after(0, lambda: self._open_crop_picker(
+                    Image.fromarray(rgb), stem))
+            except Exception as e:
+                self._log(f"[grab] ✗ capture error: {type(e).__name__}: {e}")
+            finally:
+                self.root.after(0, self.root.deiconify)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _open_crop_picker(self, full_img, stem):
+        """Show `full_img` scaled to fit and let the operator drag a box.
+
+        The crop is taken from the FULL-resolution image, never from the scaled
+        preview -- a template saved at preview scale would never match the real
+        screen.
+        """
+        win = tk.Toplevel(self.root)
+        win.title(f"Drag a box around the button — {stem}")
+        win.configure(bg=BG)
+
+        sw = max(640, self.root.winfo_screenwidth() - 120)
+        sh = max(480, self.root.winfo_screenheight() - 200)
+        scale = min(sw / full_img.width, sh / full_img.height, 1.0)
+        dw, dh = int(full_img.width * scale), int(full_img.height * scale)
+        preview = full_img.resize((dw, dh), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(preview)
+
+        tk.Label(win, bg=BG, fg=YELLOW, font=("Segoe UI", 9, "bold"),
+                 text="Drag a box tightly around the button, then Save. "
+                      "Esc cancels.").pack(anchor="w", padx=8, pady=(6, 2))
+        canvas = tk.Canvas(win, width=dw, height=dh, bg=BG,
+                           highlightthickness=0, cursor="crosshair")
+        canvas.pack(padx=8)
+        canvas.create_image(0, 0, anchor="nw", image=photo)
+        canvas._photo = photo                      # Tk keeps no reference
+
+        info = tk.Label(win, bg=BG, fg=FG, font=("Consolas", 9),
+                        text="no selection")
+        info.pack(anchor="w", padx=8, pady=(2, 0))
+
+        sel = {"x0": 0, "y0": 0, "x1": 0, "y1": 0, "rect": None}
+
+        def to_full(v):
+            return int(round(v / scale))
+
+        def on_press(e):
+            sel["x0"], sel["y0"] = e.x, e.y
+            if sel["rect"]:
+                canvas.delete(sel["rect"])
+            sel["rect"] = canvas.create_rectangle(e.x, e.y, e.x, e.y,
+                                                  outline=GREEN, width=2)
+
+        def on_drag(e):
+            sel["x1"], sel["y1"] = e.x, e.y
+            if sel["rect"]:
+                canvas.coords(sel["rect"], sel["x0"], sel["y0"], e.x, e.y)
+            w, h = abs(to_full(e.x - sel["x0"])), abs(to_full(e.y - sel["y0"]))
+            info.config(text=f"{w} x {h} px at full resolution")
+
+        def box():
+            x0, x1 = sorted((sel["x0"], sel["x1"]))
+            y0, y1 = sorted((sel["y0"], sel["y1"]))
+            return (to_full(x0), to_full(y0), to_full(x1), to_full(y1))
+
+        def save(_=None):
+            x0, y0, x1, y1 = box()
+            if x1 - x0 < 8 or y1 - y0 < 8:
+                info.config(text="selection too small — drag a bigger box",
+                            fg=RED)
+                return
+            out = TEMPLATE_DIR / f"{stem}.png"
+            full_img.crop((x0, y0, x1, y1)).save(str(out))
+            rule = guard_rule_for(stem)
+            self._log(f"[grab] ✓ saved '{out.name}' "
+                      f"({x1-x0}x{y1-y0}px from {x0},{y0})"
+                      + (f"\n        GUARDED by rule '{rule['pattern']}' — it "
+                         f"will not click unless that verifier approves."
+                         if rule else
+                         "\n        Tick its 'auto' box to enable it."))
+            win.destroy()
+            self.root.after(150, self._refresh_autoclick_list)
+
+        canvas.bind("<ButtonPress-1>", on_press)
+        canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<ButtonRelease-1>", on_drag)
+        win.bind("<Escape>", lambda _: win.destroy())
+        win.bind("<Return>", save)
+
+        row = tk.Frame(win, bg=BG); row.pack(fill="x", padx=8, pady=8)
+        tk.Button(row, text="Save template", command=save, bg=BG2, fg=GREEN,
+                  relief="flat", cursor="hand2", font=("Segoe UI", 9, "bold"),
+                  padx=10, pady=4).pack(side="left")
+        tk.Button(row, text="Cancel", command=win.destroy, bg=BG2, fg=RED,
+                  relief="flat", cursor="hand2", font=("Segoe UI", 9),
+                  padx=10, pady=4).pack(side="left", padx=6)
+
     def _toggle_autoclick_scan(self):
         if self._autoclick_running:
             self._autoclick_running = False
@@ -3487,9 +3881,10 @@ class SOCUltralight:
         tick a box for a template the loop could never load and nothing would
         ever happen. Returns None when no file matches.
         """
-        for cand in (TEMPLATE_DIR / f"{stem}.png", TEMPLATE_DIR / f"{stem}.PNG"):
-            if cand.exists():
-                return cand
+        for base in (TEMPLATE_DIR, PRIVATE_TEMPLATE_DIR):
+            for cand in (base / f"{stem}.png", base / f"{stem}.PNG"):
+                if cand.exists():
+                    return cand
         low = stem.lower()
         for p in template_pngs():
             if p.stem.lower() == low:
@@ -3574,6 +3969,7 @@ class SOCUltralight:
                         self._autoclick_blank_warned = False
 
                         now = time.time()
+                        best_scores = {}
                         for stem in enabled:
                             png = self._template_path(stem)
                             if png is None:
@@ -3587,6 +3983,13 @@ class SOCUltralight:
                                 continue
                             res = cv2.matchTemplate(screen_bgr, tmpl, cv2.TM_CCOEFF_NORMED)
                             _, max_val, _, max_loc = cv2.minMaxLoc(res)
+                            # Remember the best score even on a MISS. Without
+                            # this the loop is silent unless it hits, so a
+                            # template sitting at 0.79 and a loop that is
+                            # completely dead produce identical output - which
+                            # is exactly how "it just never clicks" stayed
+                            # undiagnosable. Reported below, throttled.
+                            best_scores[stem] = max_val
                             if max_val >= TEMPLATE_THRESH:
                                 h_t, w_t = tmpl.shape[:2]
                                 # Add monitor origin so coords are Windows screen coords,
@@ -3595,11 +3998,61 @@ class SOCUltralight:
                                 # (mon['top'] or mon['left'] is negative).
                                 cx = max_loc[0] + w_t // 2 + mon_left
                                 cy = max_loc[1] + h_t // 2 + mon_top
+
+                                # A guarded template matching only NOMINATES
+                                # it. Something that is not pixels must agree
+                                # before the desktop is handed to a stranger.
+                                rule = guard_rule_for(stem)
+                                if rule:
+                                    rect = (max_loc[0] + mon_left,
+                                            max_loc[1] + mon_top, w_t, h_t)
+                                    try:
+                                        allowed, why = load_guard_callable(rule)(
+                                            screen_bgr, rect)
+                                    except Exception as e:
+                                        # A policy that cannot be loaded blocks
+                                        # the click. It must never allow it.
+                                        allowed = False
+                                        why = f"guard unavailable - {type(e).__name__}: {e}"
+                                    if not allowed:
+                                        # Cool down on refusal too, or a
+                                        # standing prompt re-reads the card
+                                        # every scan and floods the log.
+                                        self._autoclick_last[stem] = time.time()
+                                        self._log(
+                                            f"[auto-click] \u26d4 {stem} matched "
+                                            f"(conf={max_val:.2f}) but NOT clicked"
+                                            f" \u2014 {why}")
+                                        continue
+                                    self._log(
+                                        f"[auto-click] \U0001f512 {stem} guard "
+                                        f"passed \u2014 {why}")
+
                                 pyautogui.click(cx, cy)
                                 self._autoclick_last[stem] = time.time()
                                 self._log(
                                     f"[auto-click] ✓ {stem}  conf={max_val:.2f}  "
                                     f"→ clicked ({cx},{cy})")
+                        # Say what the scan actually SAW. Only misses are
+                        # reported (a hit logs itself above) and only every
+                        # AUTOCLICK_REPORT_EVERY seconds, so a running scan
+                        # proves it is alive and shows how far off it is
+                        # without burying the log.
+                        if best_scores and (time.time() - self._autoclick_last_report
+                                            >= AUTOCLICK_REPORT_EVERY):
+                            self._autoclick_last_report = time.time()
+                            ranked = sorted(best_scores.items(), key=lambda kv: -kv[1])
+                            shown = ", ".join(f"{s}={v:.2f}" for s, v in ranked[:4])
+                            top = ranked[0][1]
+                            verdict = ("near miss - re-capture on Linux or lower "
+                                       "the threshold"
+                                       if top >= TEMPLATE_THRESH - 0.12 else
+                                       "nothing close - target not on screen, or "
+                                       "template came from another OS")
+                            self._log(
+                                f"[auto-click] scanning, no match (best of "
+                                f"{len(best_scores)} vs thresh "
+                                f"{TEMPLATE_THRESH:.2f}): {shown} - {verdict}")
                 except Exception as e:
                     self._log(f"[auto-click] scan error: {e}")
                 time.sleep(AUTOCLICK_SCAN)

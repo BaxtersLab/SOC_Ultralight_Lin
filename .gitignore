@@ -20,3 +20,20 @@ outbox/
 sent/
 staging/
 transcript/
+
+
+# ── Operator-private templates and policy — NEVER COMMIT ─────────────────────
+# This remote is public and the rest of "buttons database" IS tracked, so a
+# crop dropped in there is published by default. Some crops show things that
+# must not be: an account name, a device identifier, the contents of a window.
+#
+# Anything under buttons database/private/ is scanned by SOC exactly like the
+# main library but never enters version control. A whole directory rather than
+# a name pattern, so nothing depends on remembering to name a file correctly.
+buttons database/private/
+
+# Operator policy (guard manifest and verifier modules) lives in
+# $XDG_CONFIG_HOME/soc-ultralight/guards/ — outside this repo entirely, so it
+# cannot be committed even by accident. These rules catch stray local copies.
+guards/
+manifest.json
