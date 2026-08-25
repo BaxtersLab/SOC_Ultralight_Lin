@@ -144,9 +144,21 @@ class LoopWiringTests(unittest.TestCase):
         has been baked into a public tool."""
         r = subprocess.run(["git", "ls-files"], cwd=REPO,
                            capture_output=True, text=True)
-        offenders = [ln for ln in r.stdout.splitlines()
-                     if "guards/" in ln or ln.endswith("_guard.py")]
+        offenders = []
+        for ln in r.stdout.splitlines():
+            if ln.startswith("tests/"):
+                continue          # this file is a TEST, not a verifier
+            if "guards/" in ln or ln.endswith("_guard.py") or ln.endswith("manifest.json"):
+                offenders.append(ln)
         self.assertEqual(offenders, [], f"verifier tracked in the repo: {offenders}")
+
+    def test_the_check_would_still_catch_a_real_verifier(self):
+        """Guards the tests/ exclusion above: a verifier placed anywhere the
+        repo could actually carry one must still be refused by git."""
+        for name in ("guards/manifest.json", "guards/anything_guard.py"):
+            r = subprocess.run(["git", "check-ignore", name],
+                               cwd=REPO, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, f"git would track {name}")
 
     def test_guard_policy_lives_outside_the_repo(self):
         for pth in (soc.GUARD_DIR, soc.GUARD_MANIFEST):
