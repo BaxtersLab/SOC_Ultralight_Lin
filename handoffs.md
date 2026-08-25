@@ -2,6 +2,221 @@
 
 _Append-only (Article VIII). Newest entry at the top._
 
+## [2026-08-24] — Auto-click was never broken: it was **silent**. Plus guarded templates, Wayland-safe capture, and Timer Prompt's icon
+
+### The auto-click report, and why every prior fix missed
+
+Operator: "not autoclicking how it should — never clicks at all." Every
+mechanical link was measured on this box this session and **all of them pass**:
+
+| link | measured |
+| --- | --- |
+| portal capture | 1920x1080, mean 30.34, stdev 46.12 — real pixels |
+| coordinate space | stream size == screen size, origin (0,0), scale 1.0 |
+| template resolution | all 5 enabled stems resolve past the `.PNG`/`.png` trap |
+| template loading | all RGBA but **fully opaque**, so `IMREAD_COLOR` is lossless |
+| the matcher | template pasted into the frame → conf **1.0000** at the exact pixel |
+| frame freshness | 8 consecutive scans → 8 distinct hashes, no stale buffers |
+| hands guard | 11/11 in isolation ×3; 0 spurious cursor events in 5 s of polling |
+| `_mss_ctor()` | opens fine under XWayland — does not kill the loop thread |
+
+So the loop runs, sees a real desktop, and matches correctly. What it did
+**not** do is say anything unless it hit. `_autoclick_loop` logged only on a
+match, so a template sitting at 0.79 and a completely dead loop produced
+**identical output — silence**. That is why this survived the 2026-08-03
+backend fix and the 2026-08-02 case-sensitivity fix: each removed a real cause,
+and the remaining failure looked exactly the same from outside.
+
+Measured against the live screen, the five enabled templates score **0.55–0.65**
+against `TEMPLATE_THRESH = 0.80`. All five are the uppercase-`.PNG`
+Windows-captured generation. `registry.json` agrees: `agent2_allow.png` has
+matched **twice, ever** (`trained: false`).
+
+Two further numbers worth keeping:
+
+* One `desktop().frame()` costs **~1.6 s** steady-state, so with
+  `AUTOCLICK_SCAN = 1.5` the real scan period is **~3.1 s**, not 1.5 s.
+* `AUTOCLICK_COOLDOWN = 3.0` is therefore **shorter than the scan period** and
+  currently suppresses nothing.
+
+#### Fixed
+
+* **Per-scan best-score reporting.** Misses now log the best score per template
+  every `AUTOCLICK_REPORT_EVERY` (12 s), with a verdict distinguishing "near
+  miss — re-capture on Linux" from "nothing close". A running scan now proves
+  it is alive.
+* **`◉ Probe` button** beside `▶ Scan`. Scores every enabled template against
+  the screen *right now* and prints conf, size and location — the tool for the
+  moment the target IS on screen.
+
+**Still open:** the five Windows-era templates want re-capturing on Linux. The
+instrumentation above turns that from guesswork into a number.
+
+### Guarded templates — a mechanism, deliberately without policy
+
+Most templates are safe to click on sight. Some are not: a button that grants
+access, authorises a payment or confirms a destructive action costs far more
+than one wrong click, and template matching cannot tell a wanted prompt from an
+unwanted one — the pixels are identical either way.
+
+A guarded template's match only **nominates** it. An external verifier must
+also approve before the click happens.
+
+**SOC ships no verifiers and knows nothing about what any of them check.**
+Which applications matter, what counts as proof, and what may be automated are
+site decisions, not properties of a screen-automation tool. Verifiers load at
+run time from `$XDG_CONFIG_HOME/soc-ultralight/guards/` — a manifest plus
+modules, outside this repository — so an operator's policy is never published
+alongside the tool that runs it.
+
+Fails **closed** at every step. A pattern that matches but whose verifier is
+missing, unloadable, or raises does **not** click. Otherwise a broken policy
+silently downgrades to no policy, which is the worst outcome for exactly the
+templates the mechanism protects. `load_guard_callable` raises rather than
+returning `None` for that reason: the caller reads an exception as a refusal,
+where `None` would read as "unguarded".
+
+A malformed manifest yields no rules — i.e. nothing guarded — so `guard_error()`
+reports it loudly. One typo must not disarm every guard in silence.
+
+Rules match on a **normalised** stem. The operator names a template when
+capturing it, and a near-miss on case or punctuation must not quietly downgrade
+a guarded button to an ordinary one.
+
+### `buttons database/private/`
+
+Git-ignored wholesale, scanned exactly like the main library. Some crops show
+things that must not be published — an account name, a device identifier, the
+contents of a window. A whole directory rather than a name pattern, so nothing
+depends on remembering to name a file correctly.
+
+### Template capture that works on Wayland
+
+`Train` waits for a physical click, then crops around `PLATFORM.cursor_pos()`.
+On Wayland **both halves are dead**:
+
+* `cursor_pos()` is in `WaylandPlatform.UNSUPPORTED` — no protocol exists to
+  query the global pointer. It returns dead-reckoned `(0, 0)`, so the crop
+  comes from the screen corner rather than the button.
+* `left_button_down()` needs `evdev` plus `/dev/input` access; `evdev` is not
+  installed in the venv, so it returns False forever and training times out.
+
+Neither reports an error, so training on Wayland yields either nothing or a
+template of the wrong pixels — and a wrong template never matches, which is
+indistinguishable from the auto-click failure it was meant to fix. `Train` also
+only ever offered to re-capture templates that **already existed**; there was no
+way to create a new one from the UI at all.
+
+**`＋ Grab`** replaces it: name the template, SOC hides itself, grabs a portal
+frame, and the operator drags a box over it. Every click is inside SOC's own
+window where Tk reports real coordinates, and the crop is taken at **full
+resolution**, never at preview scale. A normal resizable Toplevel — not
+fullscreen, not `overrideredirect` (Article XIV, and this box's Timer Prompt
+already proved override-redirect windows never get keyboard focus here).
+
+### Timer Prompt had no icon at all — generic gear on the taskbar
+
+Three separate causes, all present:
+
+* **No window icon.** `timer_prompt.py` called neither `iconphoto` nor
+  `iconbitmap` anywhere, so there was no `_NET_WM_ICON` for the taskbar to read.
+* **`tk.Tk()` with no `className`** → `WM_CLASS = "Tk"`, so the window could
+  never associate with a launcher.
+* **No `.desktop` entry existed.**
+
+A launcher's `Icon=` key alone would not have fixed this — it dresses the dash
+entry, not the mapped window. Both halves are required.
+
+#### Built
+
+`assets/timer-prompt-{16,24,32,48,64,128,256}.png` — a clock in Timer Prompt's
+own palette (`ACCENT` ring and hour hand, `YELLOW` minute hand, `DIM` ticks).
+**48 px drove the design**, that being what the dash renders: a thick ring
+rather than a thin outline, **four** tick marks rather than twelve (twelve
+become a grey smear), two hands at 10:10 with a clear length difference, and no
+numerals. Drawn at 4× and downsampled because Pillow has no antialiased
+arc/line, and a jagged ring is exactly what makes an icon look broken.
+Generator kept at `make_timer_icon.py`. Checked by eye at 48, 32 and 24.
+
+`packaging/timer-prompt.desktop` — `Exec` points at **`timer_prompt.sh`**, never
+the `.py`: the widget types into another application, and without
+`SOC_PLATFORM` set on a Wayland session pyautogui falls back to XTEST, whose
+keystrokes reach XWayland and never a native Wayland client. The prompt would
+look sent and land nowhere. A test asserts this.
+
+#### A trap worth recording
+
+`py_compile` passed on a `timer_prompt.py` that **could not be imported**:
+`ICON_DIR` used `Path` before `pathlib` was imported → `NameError` at import
+time. `py_compile` checks syntax, not names. Article IX already says
+`cargo check` is not testing; this is the Python face of the same thing —
+**compile-clean is not import-clean.** Regression test added.
+
+#### Verified
+
+* `desktop-file-validate` — clean, no warnings and no hints.
+* Icon **live on the window**, read with Xlib per §7 (not `xprop`, which cannot
+  print a 256px leading icon): **90,190 CARDINALs**, sizes
+  `256/128/64/48/32/24/16`.
+* `WM_CLASS = "timer-prompt", "Timer-prompt"` — matches
+  `StartupWMClass=timer-prompt`.
+* Gate: **205 passed, 19 subtests, 0 failed.**
+
+### Correction — the 2026-08-08 icon verification does not reproduce
+
+That entry records SOC's window icon as proven with
+`_NET_WM_ICON reads 256, 256, 4278255873, …`. **`xprop` prints NOTHING when the
+leading icon is 128px or larger**, and SOC's is 256 — so that output cannot have
+come from the command as written.
+
+**The icon is fine.** Re-verified 2026-08-24 by running SOC's exact code path
+(`PhotoImage` → `iconphoto(True, img)`, soc_ultralight.py:9603) against the real
+`assets/soc-ultralight.png`: **65,538 CARDINALs, first icon 256x256**, while
+`xprop` on the same window returned 24 characters and no values.
+
+The hazard is the recorded method, not the icon: re-running that check returns
+an empty result that looks exactly like a regression. Full measurements, the
+`128px` threshold and the Xlib snippet that reads it correctly are in
+**`../MAIN_HANDOFF.md` §7**. Note also that Tk sets the property on the **WM
+frame**, not on `root.winfo_id()`.
+
+### NOT verified — the guard mechanism has never refused a real click
+
+`load_guard_callable` and `guard_rule_for` are unit-tested against throwaway
+policy in a temp directory, and the loop is asserted to consult them before
+`pyautogui.click`. But no verifier has yet run against a real matched template
+on a real screen: that needs an operator policy installed in
+`$XDG_CONFIG_HOME/soc-ultralight/guards/` and a template that matches it.
+
+Until then the mechanism is proven and the *integration* is not.
+
+## [2026-08-18] — Timer Prompt hour/minute fields couldn't be typed into: `overrideredirect` windows never get keyboard focus under this box's Mutter/XWayland
+
+Operator report: clicking into the h/m/grace/x/y `Entry` fields let you drag
+to select existing text (mouse events land fine) but typed digits never
+appeared.
+
+**Root cause:** `timer_prompt.py`'s main window used `overrideredirect(True)`
+for a borderless, custom-title-bar look. On this box's compositor (GNOME
+Mutter, Wayland session), an override-redirect XWayland window is *never*
+handed keyboard input — confirmed by instrumenting a `bind_all("<KeyPress>",
+...)` handler that received zero events while the widget was focused and
+being typed into. `focus_force()` and even an explicit local `grab_set()`
+(`XGrabKeyboard`) made no difference — Mutter does not deliver key events to
+these windows at all, full stop. Mouse worked because drag-select only needs
+a pointer grab.
+
+**Fix:** drop `overrideredirect(True)` entirely so Mutter manages the window
+normally, same as every other working app on this box. Costs the fully
+borderless look (there's now a real WM title bar in addition to the widget's
+own drag-bar/✕ button) but restores real keyboard focus. Verified live: the
+operator confirmed typing into the hour field now works.
+
+**Takeaway for any other widget on this box that wants a borderless/
+always-on-top look (the marker picker in this same file, VS Mic Widget, splash
+screens, etc.):** `overrideredirect` is safe ONLY for mouse-only surfaces.
+Anything that needs the user to type must be a normal decorated `Toplevel`.
+
 ## [2026-08-09] — **Repository rebuilt** to drop two desktop screenshots; re-cloning exposed a fresh-install bug that had been invisible for the whole port
 
 Operator deleted the public repo and had this box push a sanitized rebuild.
