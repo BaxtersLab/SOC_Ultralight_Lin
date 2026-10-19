@@ -1,0 +1,29 @@
+# Third-party code shipped inside baxters-soc-ultralight
+
+Everything SOC Ultralight needs comes from Ubuntu packages, declared in the
+package's Depends, with two exceptions. Neither has a package in the Ubuntu
+archive, both are pure Python, and both are therefore vendored in `vendor/`.
+
+## mss 10.2.0 — MIT
+
+Screen capture. Vendored verbatim; nothing here patches it.
+Licence text: `vendor/LICENSE.mss.txt`.
+Upstream: https://github.com/BoboTiG/python-mss
+
+## pytesseract 0.3.13 — Apache License 2.0
+
+A thin wrapper around the `tesseract` binary, which this package depends on as
+`tesseract-ocr` rather than bundling. Vendored verbatim; nothing here patches it.
+Licence text: `vendor/LICENSE.pytesseract.txt`.
+Upstream: https://github.com/madmaze/pytesseract
+
+## Why vendored rather than pip-installed
+
+Until 2026-09-25 the launcher created a virtualenv and ran
+`pip install -r requirements.txt` on first start. That reached the network at
+start-up, which the packaging contract forbids, and could not work at all once
+installed, because the install directory is root-owned. Vendoring two pure
+Python modules removes the need for either.
+
+Both licences are permissive and require only that the notice travel with the
+code, which `vendor/LICENSE.*.txt` and this file satisfy.

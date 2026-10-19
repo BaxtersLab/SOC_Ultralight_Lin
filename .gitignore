@@ -37,3 +37,14 @@ buttons database/private/
 # cannot be committed even by accident. These rules catch stray local copies.
 guards/
 manifest.json
+
+# ── Added 2026-09-25 (packaging agent) ───────────────────────────────────────
+# Build output. target/ at any depth; dist/ holds built .deb files.
+target/
+dist/
+*.deb
+venv/
+
+# Working notes and hand-made backups stay on the box (first public update after r10k).
+/handoffs.md
+*.bak

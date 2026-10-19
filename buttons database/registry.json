@@ -235,5 +235,11 @@
     "conf_sum": 0.9302437901496887,
     "trained": false,
     "action": "click"
+  },
+  "vs_code_allow.png": {
+    "matches": 0,
+    "conf_sum": 0.0,
+    "trained": false,
+    "action": "click"
   }
 }

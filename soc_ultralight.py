@@ -388,8 +388,34 @@ GPU_LOCK_TIMEOUT  = 90.0   # hard safety: force-release a slot held longer than 
 GPU_ACQUIRE_GRACE = 8.0    # release if the holder never actually starts inferring in time
 
 BASE_DIR      = Path(__file__).parent
-OUTBOX_DIR    = BASE_DIR / "outbox"
-TRANSCRIPT_DIR = BASE_DIR / "transcript"  # durable, human-readable inter-agent log
+
+# ── Writable state vs read-only payload ──────────────────────────────────────
+#
+# Everything SOC writes used to live beside this script. That is fine for a
+# checkout and impossible for an install: at /opt/baxters/soc-ultralight the
+# script's directory is ROOT-OWNED, so a normal user's first launch could not
+# create the outbox, save a config, capture a template or touch the heartbeat.
+# The app would start and then fail at its first write.
+#
+# BASE_DIR therefore stays READ-ONLY payload (SOP prompts, plugins, the shipped
+# template library). STATE_DIR is everything SOC writes, under the user's own
+# data directory, seeded from the payload on first run so a fresh install still
+# has the shipped templates.
+#
+# SOC_STATE_DIR overrides it, which is what tests use -- they must never touch
+# a real user's state.
+def _resolve_state_dir() -> Path:
+    override = os.environ.get("SOC_STATE_DIR")
+    if override:
+        return Path(override).expanduser()
+    xdg = os.environ.get("XDG_DATA_HOME")
+    root = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share"
+    return root / "soc-ultralight"
+
+
+STATE_DIR     = _resolve_state_dir()
+OUTBOX_DIR    = STATE_DIR / "outbox"
+TRANSCRIPT_DIR = STATE_DIR / "transcript"  # durable, human-readable inter-agent log
 
 # ── SOC bridge (exact local-agent reply channel) ────────────────────────────
 # The local CD-changer agents (A5/A6/A7) all render into the ONE GGUF Chatbox
@@ -406,10 +432,10 @@ SOC_BRIDGE_MARKER    = SOC_BRIDGE_DIR / "soc_active.json"
 BRIDGE_MARKER_REFRESH = 30.0    # rewrite the marker this often so it stays "fresh"
 BRIDGE_POLL           = 0.5     # replies-folder poll interval
 BRIDGE_TRUST_WINDOW   = 300.0   # suppress the OCR route this long after the last bridge reply
-HEARTBEAT_FILE = BASE_DIR / ".soc_alive"  # liveness ping — transcript monitor self-closes when it stops
-SENT_DIR      = BASE_DIR / "sent"
-TEMPLATE_DIR  = BASE_DIR / "buttons database"   # drop cropped PNGs here
-CONFIG_FILE   = BASE_DIR / "config.json"         # auto-saved coords + window titles
+HEARTBEAT_FILE = STATE_DIR / ".soc_alive"  # liveness ping — transcript monitor self-closes when it stops
+SENT_DIR      = STATE_DIR / "sent"
+TEMPLATE_DIR  = STATE_DIR / "buttons database"   # drop cropped PNGs here
+CONFIG_FILE   = STATE_DIR / "config.json"         # auto-saved coords + window titles
 
 TEMPLATE_THRESH  = 0.80   # minimum match confidence (0-1)
 SCROLL_PAUSE     = 0.40   # seconds between scroll steps
@@ -620,6 +646,43 @@ for _d in [OUTBOX_DIR / "agent1", OUTBOX_DIR / "agent2", OUTBOX_DIR / "agent3",
            SENT_DIR   / "agent1", SENT_DIR   / "agent2", SENT_DIR   / "agent3",
            TRANSCRIPT_DIR, TEMPLATE_DIR]:
     _d.mkdir(parents=True, exist_ok=True)
+
+
+def _seed_state_from_payload() -> None:
+    """Copy shipped read-only defaults into STATE_DIR on first run.
+
+    The template library ships 47 PNGs inside the package. Once TEMPLATE_DIR
+    moved to the user's data directory, a fresh install would otherwise start
+    with an EMPTY library and match nothing -- the app would look broken while
+    behaving exactly as written.
+
+    Copies only what is missing, so a user's own captures and edits are never
+    overwritten, and a deleted template stays deleted rather than reappearing
+    on the next launch.
+    """
+    shipped_templates = BASE_DIR / "buttons database"
+    if shipped_templates.is_dir():
+        for src in shipped_templates.rglob("*"):
+            if not src.is_file():
+                continue
+            dst = TEMPLATE_DIR / src.relative_to(shipped_templates)
+            if dst.exists():
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(src, dst)
+            except OSError:
+                pass          # a seed failure must never stop the app starting
+
+    shipped_config = BASE_DIR / "config.json"
+    if shipped_config.is_file() and not CONFIG_FILE.exists():
+        try:
+            shutil.copy2(shipped_config, CONFIG_FILE)
+        except OSError:
+            pass
+
+
+_seed_state_from_payload()
 
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE    = 0.1
@@ -1292,7 +1355,7 @@ content will arrive here as if typed by SOC. Treat it as any other inbound messa
 # path triggers a blocking Tkinter modal asking the user to Approve or Deny.
 # Bypasses are NOT permitted — not by Agent 3 authority, not by implementation
 # mode, not by any agent. The user is the only authority for self-modification.
-SELF_MOD_LOG = BASE_DIR / "data_log" / "self_mod_gate.jsonl"
+SELF_MOD_LOG = STATE_DIR / "data_log" / "self_mod_gate.jsonl"
 
 # Filenames inside SOC_Ultralight/ that are off-limits without user approval.
 # Stem-only matches so renames (.py.bak etc.) still catch.
@@ -6210,7 +6273,7 @@ class SOCUltralight:
         search_x = (rx0 + rx1) // 2
         # Search top quarter of region — that's where header landmarks live
         search_y = ry0 + (ry1 - ry0) // 4
-        btn_dir = BASE_DIR / "buttons database"
+        btn_dir = TEMPLATE_DIR
         try:
             landmarks = [
                 p.name for p in btn_dir.iterdir()
@@ -6326,7 +6389,7 @@ class SOCUltralight:
 
         # 2. Historical nudge positions from nudge_log.json
         try:
-            log_path = BASE_DIR / "nudge_log.json"
+            log_path = STATE_DIR / "nudge_log.json"
             if log_path.exists():
                 entries = _json.loads(log_path.read_text(encoding="utf-8"))
                 nearby = [
@@ -6628,7 +6691,7 @@ class SOCUltralight:
         # ── Log position + outcome for future healing ─────────────────────────
         try:
             import json as _json
-            log_path = BASE_DIR / "nudge_log.json"
+            log_path = STATE_DIR / "nudge_log.json"
             entries = []
             if log_path.exists():
                 try:
@@ -7300,10 +7363,12 @@ class SOCUltralight:
                 parts = args.split(None, 1)
                 if len(parts) == 2:
                     rel_path, content = parts
-                    target = (BASE_DIR / rel_path).resolve()
-                    # Security: must stay inside BASE_DIR
+                    target = (STATE_DIR / rel_path).resolve()
+                    # Security: must stay inside STATE_DIR. The check moved with
+                    # the target -- confining agent writes to a read-only payload
+                    # directory would be broken AND pointless.
                     try:
-                        target.relative_to(BASE_DIR)
+                        target.relative_to(STATE_DIR.resolve())
                     except ValueError:
                         self._log(f"[cmd] path escape blocked: {rel_path}")
                         continue
@@ -7700,7 +7765,7 @@ class SOCUltralight:
         clears the file, and routes the text as if OCR saw it from agent3.
         This lets the Claude Code CLI inject messages without needing a visible
         window on screen — no OCR region required for agent3."""
-        relay_path = BASE_DIR / "agent3_out.txt"
+        relay_path = STATE_DIR / "agent3_out.txt"
         while True:
             try:
                 if relay_path.exists():
@@ -7733,7 +7798,7 @@ class SOCUltralight:
         we execute it on the Tk main thread and clear the file. This lets the master
         widget bring the A4 vision window forward without launching any process
         (so there is nothing that can become a zombie). Commands: 'show_a4'."""
-        sig_path = BASE_DIR / self.SOC_CONTROL_FILE
+        sig_path = STATE_DIR / self.SOC_CONTROL_FILE
         while True:
             try:
                 if sig_path.exists():
@@ -7843,7 +7908,7 @@ class SOCUltralight:
     def _log(self, msg: str):
         # Mirror to staging/soc_debug.log so external tools can tail it
         try:
-            log_dir = BASE_DIR / "staging"
+            log_dir = STATE_DIR / "staging"
             log_dir.mkdir(exist_ok=True)
             with open(log_dir / "soc_debug.log", "a", encoding="utf-8") as _lf:
                 _lf.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")

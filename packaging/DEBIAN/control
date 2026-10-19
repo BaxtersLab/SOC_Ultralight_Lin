@@ -1,0 +1,32 @@
+Package: baxters-soc-ultralight
+Version: 1.0.1-3
+Section: utils
+Priority: optional
+Architecture: all
+Maintainer: Baxters Lab <165753632+Baxterv5@users.noreply.github.com>
+Depends: python3 (>= 3.11), python3-gi, gir1.2-gst-plugins-base-1.0,
+ python3-pil, python3-pil.imagetk, python3-tk, python3-numpy, python3-opencv, python3-pyautogui,
+ python3-pyperclip, python3-requests, python3-xlib, python3-ewmh,
+ tesseract-ocr, xdg-utils
+Recommends: python3-evdev
+Description: SOC Ultralight — multi-agent screen orchestration
+ Drives several chat agents on one desktop: reads their windows, routes
+ messages between them, and clicks through their interfaces by template match.
+ .
+ DISTRO interpreter lane (A1 section 2a): it needs gi, which has no PyPI wheel
+ and is ABI-bound to the system interpreter, so it does not use baxters-runtime.
+ .
+ EVERY dependency is declared here rather than fetched. Until 2026-09-25 the
+ launcher built a virtualenv and pip-installed into it on first start, which
+ could not work once installed -- /opt/baxters/soc-ultralight is root-owned, so
+ a normal user's first launch could not create it -- and which reached the
+ network at start-up, forbidden by A1 section 7.1.
+ .
+ Two modules have no Ubuntu package at all (mss, pytesseract). Both are pure
+ Python and are VENDORED in the payload under vendor/, with their licences; see
+ THIRD_PARTY_LICENSES. tesseract-ocr is the binary pytesseract drives -- without
+ it OCR fails at run time while every import succeeds.
+ .
+ python3-evdev is Recommends, not Depends: it is imported inside a try/except
+ that returns False, so its absence costs one input-capability probe and
+ nothing else.

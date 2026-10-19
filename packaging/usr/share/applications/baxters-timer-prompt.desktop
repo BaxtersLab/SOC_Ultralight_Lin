@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Timer Prompt
+GenericName=Scheduled prompt sender
+Comment=Send a prompt to an agent window at a scheduled time
+# Must be timer_prompt.sh, never timer_prompt.py directly: the widget types
+# into ANOTHER application, and without SOC_PLATFORM set on a Wayland session
+# pyautogui falls back to XTEST, whose keystrokes reach XWayland and never a
+# native Wayland client. The prompt would look sent and land nowhere.
+Exec=/opt/baxters/soc-ultralight/timer_prompt.sh
+TryExec=/opt/baxters/soc-ultralight/timer_prompt.sh
+Path=/opt/baxters/soc-ultralight
+Icon=baxters-timer-prompt
+Terminal=false
+Categories=Utility;
+Keywords=timer;prompt;schedule;clock;agent;
+StartupNotify=true
+# Tk sets WM_CLASS from tk.Tk(className=…) in timer_prompt.py's entry point.
+# Bare tk.Tk() gives WM_CLASS "Tk" and the shell shows a generic gear.
+StartupWMClass=timer-prompt
